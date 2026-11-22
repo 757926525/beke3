@@ -78,6 +78,7 @@ export interface MediaItem {
   ownerUsername?: string;
   type: 'audio' | 'video';
   title: string;
+  originalFilename?: string;
   artist: string;
   src: string;
   cover: string;
@@ -238,6 +239,13 @@ export type GlobalThemeMode =
   | 'velvet-plum'
   | 'editorial';
 export type DeviceViewMode = 'responsive' | 'mobile';
+export type MobileThemeMode =
+  | 'aurora-mobile'
+  | 'cream-editorial'
+  | 'obsidian-luxe'
+  | 'sakura-glass'
+  | 'emerald-botanical'
+  | 'cyber-prism';
 
 export interface SystemSettings {
   siteName: string;
@@ -265,6 +273,7 @@ export interface SystemSettings {
   syncIntervalSeconds: number;
   globalTheme: GlobalThemeMode; // 'modern' or 'retro'
   deviceView: DeviceViewMode; // 'responsive' or 'mobile'
+  mobileTheme?: MobileThemeMode;
   timezone?: string; // Timezone setting, e.g. 'Asia/Shanghai', 'UTC', 'America/New_York'
   fontFamily?: 'default' | 'kaiti' | 'youyuan' | 'qinzhuanshu' | 'custom';
   customFontName?: string;

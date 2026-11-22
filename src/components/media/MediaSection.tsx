@@ -62,6 +62,7 @@ export const MediaSection: React.FC = () => {
     setMedia,
     currentUser,
     uploadFile,
+    deleteUploadedFiles,
     viewModes,
     setViewMode,
     systemSettings,
@@ -116,9 +117,26 @@ export const MediaSection: React.FC = () => {
 
   const handleBatchDelete = () => {
     if (selectedIds.length === 0) return;
-    if (window.confirm(`确认批量删除选中的 ${selectedIds.length} 个音视频吗？`)) {
-      setMedia(prev => prev.filter(m => !selectedIds.includes(m.id) || !canManageMedia(m)));
+    const targets = media.filter(m => selectedIds.includes(m.id) && canManageMedia(m));
+    if (targets.length === 0) return;
+    if (window.confirm(`确认批量删除选中的 ${targets.length} 个音视频吗？`)) {
+      const deletedIds = targets.map(m => m.id);
+      const urls = targets.flatMap(m => [m.src, m.cover]);
+      const freedBytes = targets.reduce((sum, m) => sum + (Number(m.fileSize) || 0), 0);
+      const removedUserItemIds = currentUser?.role === 'admin'
+        ? targets.filter(m => m.ownerId && m.ownerId !== currentUser.id).map(m => m.id)
+        : [];
+      setMedia(prev => prev.filter(m => !deletedIds.includes(m.id)));
       setSelectedIds([]);
+      if (currentPlaying && deletedIds.includes(currentPlaying.id)) {
+        setCurrentPlaying(null);
+        setIsPlaying(false);
+      }
+      void deleteUploadedFiles(urls, {
+        exclude: { mediaIds: deletedIds },
+        freedBytes,
+        removedUserItemIds,
+      });
     }
   };
 
@@ -227,7 +245,8 @@ export const MediaSection: React.FC = () => {
     const newItem: MediaItem = {
       id: `media-${Date.now()}`,
       type: isVideo ? 'video' : 'audio',
-      title: file.name.replace(/\.[^/.]+$/, ''),
+      title: file.name.replace(/\.[^/.]+$/, '') || file.name,
+      originalFilename: file.name,
       artist: currentUser?.username || 'fox',
       ownerId: currentUser?.id,
       ownerUsername: currentUser?.username,
@@ -246,12 +265,22 @@ export const MediaSection: React.FC = () => {
 
   const handleDeleteMedia = (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
+    const target = media.find(m => m.id === id);
+    if (!target || !canManageMedia(target)) return;
     if (window.confirm('确认删除该音视频吗？')) {
-      setMedia(prev => prev.filter(m => m.id !== id || !canManageMedia(m)));
+      const removedUserItemIds = currentUser?.role === 'admin' && target.ownerId && target.ownerId !== currentUser.id
+        ? [target.id]
+        : [];
+      setMedia(prev => prev.filter(m => m.id !== id));
       if (currentPlaying?.id === id) {
         setCurrentPlaying(null);
         setIsPlaying(false);
       }
+      void deleteUploadedFiles([target.src, target.cover], {
+        exclude: { mediaIds: [id] },
+        freedBytes: Number(target.fileSize) || undefined,
+        removedUserItemIds,
+      });
     }
   };
 
@@ -397,7 +426,7 @@ export const MediaSection: React.FC = () => {
                 <span>{currentPlaying.type === 'audio' ? '正在播放音频' : '正在播放视频'}</span>
               </div>
 
-              <h3 className="text-xl md:text-2xl font-bold font-serif-sc">{currentPlaying.title}</h3>
+              <h3 className="text-xl md:text-2xl font-bold font-serif-sc break-words">{currentPlaying.originalFilename || currentPlaying.title}</h3>
               <p className="text-xs text-slate-400">{currentPlaying.artist}</p>
 
               {/* HTML5 Player */}
@@ -446,18 +475,18 @@ export const MediaSection: React.FC = () => {
                   </div>
                   <div className="min-w-0">
                     <div className="flex items-center gap-2">
-                      <span className="text-[10px] px-1.5 py-0.5 rounded font-bold uppercase bg-sky-50 dark:bg-sky-950/40 text-sky-600 dark:text-sky-400">
+                      <span className="text-[10px] px-1.5 py-0.5 rounded font-bold uppercase bg-sky-50 dark:bg-sky-950/40 text-sky-600 dark:text-sky-400 shrink-0">
                         {item.type}
                       </span>
                       <h4 className="text-sm font-bold text-slate-800 dark:text-slate-100 truncate">
-                        {item.title}
+                        {item.originalFilename || item.title}
                       </h4>
                     </div>
                     <p className="text-xs text-slate-400 truncate mt-0.5">{item.artist}</p>
                   </div>
                 </div>
 
-                <div className="flex items-center gap-3 shrink-0 text-xs text-slate-400">
+                <div className="flex items-center gap-2 shrink-0 text-xs text-slate-400">
                   <span className="font-mono">{item.duration}</span>
                   <button className="p-2 rounded-xl bg-sky-50 dark:bg-sky-950 text-sky-600 dark:text-sky-400">
                     {currentPlaying?.id === item.id && isPlaying ? (
@@ -466,6 +495,15 @@ export const MediaSection: React.FC = () => {
                       <Play className="w-3.5 h-3.5" />
                     )}
                   </button>
+                  {canManageMedia(item) && (
+                    <button
+                      onClick={e => handleDeleteMedia(item.id, e)}
+                      className="p-2 text-slate-400 hover:text-rose-600 rounded-lg hover:bg-rose-50 dark:hover:bg-rose-950 transition"
+                      title="删除媒体"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  )}
                 </div>
               </div>
             );
@@ -524,7 +562,7 @@ export const MediaSection: React.FC = () => {
                   )}
                 </div>
                 <h4 className="text-sm font-bold font-serif-sc text-slate-800 dark:text-slate-100 truncate group-hover:text-sky-500 transition">
-                  {item.title}
+                  {item.originalFilename || item.title}
                 </h4>
                 <div className="flex items-center gap-2 text-[11px] text-slate-400 mt-0.5">
                   <span>{item.artist}</span>

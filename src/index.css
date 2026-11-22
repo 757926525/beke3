@@ -11,8 +11,32 @@
   }
 }
 
-html, body {
-  touch-action: pan-x pan-y pinch-zoom;
+html, body, #root {
+  width: 100%;
+  max-width: 100%;
+  overflow-x: clip;
+  overscroll-behavior-x: none;
+  touch-action: pan-y pinch-zoom;
+}
+
+.overflow-x-auto {
+  touch-action: pan-x pan-y;
+  overscroll-behavior-x: contain;
+}
+
+.mobile-ui-wrap {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+@media (hover: none) and (pointer: coarse) {
+  .group:hover .group-hover\:scale-105,
+  .hover\:scale-105:hover,
+  .hover\:scale-110:hover,
+  .hover\:scale-\[1\.01\]:hover {
+    transform: none !important;
+  }
 }
 
 body {
@@ -282,3 +306,185 @@ body.retro-theme .btn-retro-secondary:hover {
 /* Authentication dialogs inherit the active theme's palette without changing AuthModal. */
 .theme-pearl-mist .auth-modal-panel,.theme-sage-atelier .auth-modal-panel,.theme-terracotta .auth-modal-panel,.theme-coastal-blue .auth-modal-panel,.theme-velvet-plum .auth-modal-panel { color:inherit !important; background:rgba(255,255,255,.94) !important; border-color:rgba(120,120,120,.2) !important; box-shadow:0 24px 80px rgba(35,40,45,.2) !important; backdrop-filter:blur(18px); }
 .theme-pearl-mist .auth-modal-panel input,.theme-sage-atelier .auth-modal-panel input,.theme-terracotta .auth-modal-panel input,.theme-coastal-blue .auth-modal-panel input,.theme-velvet-plum .auth-modal-panel input { color:inherit !important; background:rgba(255,255,255,.8) !important; }
+
+/* ==========================================================================
+   6 Fashionable Mobile UI Skins (applied on mobile view or <768px viewports)
+   ========================================================================== */
+
+.mobile-dock {
+  backdrop-filter: blur(18px);
+  -webkit-backdrop-filter: blur(18px);
+}
+
+.mobile-skin-aurora-mobile {
+  background: linear-gradient(165deg, #eef6ff 0%, #f5f9ff 52%, #e6f2fe 100%) !important;
+  color: #0f172a;
+}
+.mobile-skin-aurora-mobile header,
+.mobile-skin-aurora-mobile .mobile-dock {
+  background: rgba(255, 255, 255, 0.88) !important;
+  border-color: rgba(14, 165, 233, 0.22) !important;
+}
+.mobile-skin-aurora-mobile main section,
+.mobile-skin-aurora-mobile main article,
+.mobile-skin-aurora-mobile main div[class*="rounded-3xl"] {
+  border-color: rgba(14, 165, 233, 0.2) !important;
+  box-shadow: 0 10px 28px -12px rgba(2, 132, 199, 0.16);
+}
+
+.mobile-skin-cream-editorial {
+  background: linear-gradient(180deg, #faf6ef 0%, #f4ede2 100%) !important;
+  color: #29221c;
+}
+.mobile-skin-cream-editorial header,
+.mobile-skin-cream-editorial .mobile-dock {
+  background: rgba(252, 249, 243, 0.94) !important;
+  border-color: #e4d9c9 !important;
+  color: #29221c !important;
+}
+.mobile-skin-cream-editorial main section,
+.mobile-skin-cream-editorial main article,
+.mobile-skin-cream-editorial main div[class*="rounded-3xl"] {
+  background-color: rgba(255, 253, 249, 0.96) !important;
+  border-color: #e6dccd !important;
+  box-shadow: 0 8px 24px -14px rgba(120, 74, 30, 0.14);
+}
+.mobile-skin-cream-editorial .mobile-dock button[data-active="true"] {
+  color: #b45309 !important;
+}
+
+.mobile-skin-sakura-glass {
+  background: radial-gradient(circle at 12% 0%, #ffe4ee 0%, #fff6f9 55%, #fdf2f8 100%) !important;
+  color: #3b1d2a;
+}
+.mobile-skin-sakura-glass header,
+.mobile-skin-sakura-glass .mobile-dock {
+  background: rgba(255, 247, 250, 0.9) !important;
+  border-color: #f5cfe0 !important;
+  color: #3b1d2a !important;
+}
+.mobile-skin-sakura-glass main section,
+.mobile-skin-sakura-glass main article,
+.mobile-skin-sakura-glass main div[class*="rounded-3xl"] {
+  background-color: rgba(255, 255, 255, 0.92) !important;
+  border-color: #f4d2e1 !important;
+  box-shadow: 0 12px 30px -14px rgba(219, 39, 119, 0.16);
+}
+.mobile-skin-sakura-glass .mobile-dock button[data-active="true"] {
+  color: #db2777 !important;
+}
+
+.mobile-skin-emerald-botanical {
+  background: linear-gradient(160deg, #eff7f3 0%, #e6f2ec 55%, #f4faf7 100%) !important;
+  color: #142d23;
+}
+.mobile-skin-emerald-botanical header,
+.mobile-skin-emerald-botanical .mobile-dock {
+  background: rgba(246, 251, 248, 0.92) !important;
+  border-color: #cce3d6 !important;
+  color: #142d23 !important;
+}
+.mobile-skin-emerald-botanical main section,
+.mobile-skin-emerald-botanical main article,
+.mobile-skin-emerald-botanical main div[class*="rounded-3xl"] {
+  background-color: rgba(255, 255, 255, 0.95) !important;
+  border-color: #cfe3d8 !important;
+  box-shadow: 0 10px 26px -14px rgba(4, 120, 87, 0.14);
+}
+.mobile-skin-emerald-botanical .mobile-dock button[data-active="true"] {
+  color: #047857 !important;
+}
+
+.mobile-skin-obsidian-luxe {
+  background: radial-gradient(circle at 80% 0%, #1d2436 0%, #0b0f17 55%, #070a10 100%) !important;
+  color: #f1f5f9 !important;
+}
+.mobile-skin-obsidian-luxe header,
+.mobile-skin-obsidian-luxe .mobile-dock {
+  background: rgba(15, 21, 32, 0.94) !important;
+  border-color: #293347 !important;
+  color: #f1f5f9 !important;
+}
+.mobile-skin-obsidian-luxe main div[class*="bg-white"],
+.mobile-skin-obsidian-luxe main section[class*="bg-white"],
+.mobile-skin-obsidian-luxe main article[class*="bg-white"] {
+  background-color: #131a26 !important;
+  border-color: #293347 !important;
+  color: #f1f5f9 !important;
+}
+.mobile-skin-obsidian-luxe main div[class*="bg-slate-50"],
+.mobile-skin-obsidian-luxe main div[class*="bg-slate-100"] {
+  background-color: #1a2232 !important;
+  border-color: #2b364d !important;
+}
+.mobile-skin-obsidian-luxe main h1,
+.mobile-skin-obsidian-luxe main h2,
+.mobile-skin-obsidian-luxe main h3,
+.mobile-skin-obsidian-luxe main h4,
+.mobile-skin-obsidian-luxe main .text-slate-900,
+.mobile-skin-obsidian-luxe main .text-slate-800,
+.mobile-skin-obsidian-luxe main .text-slate-700 {
+  color: #f1f5f9 !important;
+}
+.mobile-skin-obsidian-luxe main .text-slate-600,
+.mobile-skin-obsidian-luxe main .text-slate-500,
+.mobile-skin-obsidian-luxe main .text-slate-400 {
+  color: #cbd5e1 !important;
+}
+.mobile-skin-obsidian-luxe main input,
+.mobile-skin-obsidian-luxe main textarea,
+.mobile-skin-obsidian-luxe main select {
+  background-color: #0e1420 !important;
+  border-color: #323f58 !important;
+  color: #f8fafc !important;
+}
+.mobile-skin-obsidian-luxe .mobile-dock button[data-active="true"] {
+  color: #facc15 !important;
+}
+
+.mobile-skin-cyber-prism {
+  background: radial-gradient(circle at 15% 10%, #2b1a58 0%, #120e24 58%, #0a0817 100%) !important;
+  color: #f4f3ff !important;
+}
+.mobile-skin-cyber-prism header,
+.mobile-skin-cyber-prism .mobile-dock {
+  background: rgba(20, 15, 42, 0.94) !important;
+  border-color: #3a2d6b !important;
+  color: #f4f3ff !important;
+}
+.mobile-skin-cyber-prism main div[class*="bg-white"],
+.mobile-skin-cyber-prism main section[class*="bg-white"],
+.mobile-skin-cyber-prism main article[class*="bg-white"] {
+  background-color: #1b1536 !important;
+  border-color: #3a2d6b !important;
+  color: #f4f3ff !important;
+}
+.mobile-skin-cyber-prism main div[class*="bg-slate-50"],
+.mobile-skin-cyber-prism main div[class*="bg-slate-100"] {
+  background-color: #231b45 !important;
+  border-color: #3f3174 !important;
+}
+.mobile-skin-cyber-prism main h1,
+.mobile-skin-cyber-prism main h2,
+.mobile-skin-cyber-prism main h3,
+.mobile-skin-cyber-prism main h4,
+.mobile-skin-cyber-prism main .text-slate-900,
+.mobile-skin-cyber-prism main .text-slate-800,
+.mobile-skin-cyber-prism main .text-slate-700 {
+  color: #f4f3ff !important;
+}
+.mobile-skin-cyber-prism main .text-slate-600,
+.mobile-skin-cyber-prism main .text-slate-500,
+.mobile-skin-cyber-prism main .text-slate-400 {
+  color: #d0cbe8 !important;
+}
+.mobile-skin-cyber-prism main input,
+.mobile-skin-cyber-prism main textarea,
+.mobile-skin-cyber-prism main select {
+  background-color: #140f2a !important;
+  border-color: #453680 !important;
+  color: #f4f3ff !important;
+}
+.mobile-skin-cyber-prism .mobile-dock button[data-active="true"] {
+  color: #22d3ee !important;
+}

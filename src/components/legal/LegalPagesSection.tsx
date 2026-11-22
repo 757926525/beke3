@@ -111,29 +111,29 @@ export const LegalPagesSection: React.FC = () => {
 
   const selected = PAGE_ITEMS.find(item => item.key === activePage)!;
   return (
-    <section className="mx-auto w-full max-w-5xl px-4 py-8 sm:px-6 lg:py-12">
-      <header className="mb-7 rounded-3xl border border-slate-200/80 bg-white p-6 shadow-sm dark:border-slate-700 dark:bg-slate-900 sm:p-8">
-        <div className="flex flex-wrap items-start justify-between gap-5">
-          <div>
-            <div className="mb-3 inline-flex items-center gap-2 rounded-full bg-sky-50 px-3 py-1 text-xs font-semibold text-sky-700 dark:bg-sky-950/50 dark:text-sky-300"><ShieldCheck className="h-4 w-4" />站点信息</div>
-            <h1 className="text-2xl font-bold tracking-tight text-slate-900 dark:text-white sm:text-3xl">政策与联系</h1>
-            <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-500 dark:text-slate-400">查阅站点政策与联系方式。商品和价格由 Shop 管理；首页内容由 Blog 管理。</p>
+    <section className="mx-auto w-full max-w-5xl px-1 sm:px-6 py-4 sm:py-8 lg:py-12 min-w-0">
+      <header className="mb-6 rounded-3xl border border-slate-200/80 bg-white p-4 sm:p-8 shadow-sm dark:border-slate-700 dark:bg-slate-900">
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <div className="min-w-0 flex-1">
+            <div className="mb-2.5 inline-flex items-center gap-2 text-xs font-semibold text-sky-700 dark:text-sky-300"><ShieldCheck className="h-4 w-4 shrink-0" /><span>站点信息</span></div>
+            <h1 className="text-xl sm:text-3xl font-bold tracking-tight text-slate-900 dark:text-white break-words">政策与联系</h1>
+            <p className="mt-2 max-w-2xl text-xs sm:text-sm leading-6 text-slate-500 dark:text-slate-400 break-words">查阅站点政策与联系方式。商品和价格由 Shop 管理；首页内容由 Blog 管理。</p>
           </div>
-          {isAdmin && !editing && <button type="button" onClick={beginEditing} disabled={loading} className="inline-flex items-center gap-2 rounded-xl bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-slate-700 disabled:opacity-50 dark:bg-sky-600 dark:hover:bg-sky-500"><Pencil className="h-4 w-4" />编辑政策</button>}
+          {isAdmin && !editing && <button type="button" onClick={beginEditing} disabled={loading} className="inline-flex items-center gap-2 rounded-xl bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-slate-700 disabled:opacity-50 dark:bg-sky-600 dark:hover:bg-sky-500 shrink-0"><Pencil className="h-4 w-4" />编辑政策</button>}
           {isAdmin && editing && <div className="flex flex-wrap gap-2"><button type="button" onClick={cancelEditing} disabled={saving} className="inline-flex items-center gap-2 rounded-xl border border-slate-200 px-4 py-2.5 text-sm font-semibold text-slate-600 hover:bg-slate-50 disabled:opacity-50 dark:border-slate-700 dark:text-slate-300 dark:hover:bg-slate-800"><RotateCcw className="h-4 w-4" />取消</button><button type="button" onClick={() => void savePages()} disabled={saving} className="inline-flex items-center gap-2 rounded-xl bg-sky-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-sky-500 disabled:opacity-60">{saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}{saving ? '保存中…' : '保存更改'}</button></div>}
         </div>
-        <div className="mt-6 flex gap-3 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm leading-6 text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-200"><AlertCircle className="mt-1 h-4 w-4 shrink-0" /><p>这些政策内容属于草稿，发布前请站长依据实际业务、经营主体和适用法律审阅；本页面内容不构成法律意见。</p></div>
+        <div className="mt-5 flex gap-3 rounded-2xl border border-amber-200 bg-amber-50 p-3.5 sm:p-4 text-xs sm:text-sm leading-6 text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-200"><AlertCircle className="mt-1 h-4 w-4 shrink-0" /><p className="min-w-0 break-words">这些政策内容属于草稿，发布前请站长依据实际业务、经营主体和适用法律审阅；本页面内容不构成法律意见。</p></div>
       </header>
 
-      {error && <div role="alert" className="mb-5 flex items-start gap-2 rounded-xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-700 dark:border-rose-900 dark:bg-rose-950/30 dark:text-rose-300"><AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />{error}</div>}
-      {notice && <div role="status" className="mb-5 flex items-center gap-2 rounded-xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950/30 dark:text-emerald-300"><Check className="h-4 w-4" />{notice}</div>}
+      {error && <div role="alert" className="mb-5 flex items-start gap-2 rounded-xl border border-rose-200 bg-rose-50 p-4 text-sm text-rose-700 dark:border-rose-900 dark:bg-rose-950/30 dark:text-rose-300"><AlertCircle className="mt-0.5 h-4 w-4 shrink-0" /><span className="min-w-0 break-words">{error}</span></div>}
+      {notice && <div role="status" className="mb-5 flex items-center gap-2 rounded-xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950/30 dark:text-emerald-300"><Check className="h-4 w-4 shrink-0" /><span>{notice}</span></div>}
 
-      <div className="grid gap-5 md:grid-cols-[240px_minmax(0,1fr)]">
-        <nav aria-label="法律页面" className="h-fit rounded-2xl border border-slate-200 bg-white p-2 shadow-sm dark:border-slate-700 dark:bg-slate-900">
-          {PAGE_ITEMS.map(item => <button key={item.key} type="button" onClick={() => setActivePage(item.key)} aria-current={activePage === item.key ? 'page' : undefined} className={`flex w-full items-start gap-3 rounded-xl px-3 py-3 text-left transition ${activePage === item.key ? 'bg-sky-50 text-sky-800 dark:bg-sky-950/50 dark:text-sky-200' : 'text-slate-600 hover:bg-slate-50 dark:text-slate-300 dark:hover:bg-slate-800'}`}><FileText className="mt-0.5 h-4 w-4 shrink-0" /><span><span className="block text-sm font-semibold">{item.label}</span><span className="mt-0.5 block text-xs opacity-70">{item.description}</span></span></button>)}
+      <div className="flex flex-col gap-4">
+        <nav aria-label="法律页面" className="flex items-center gap-2 overflow-x-auto touch-pan-x rounded-2xl border border-slate-200 bg-white p-2 shadow-sm dark:border-slate-700 dark:bg-slate-900">
+          {PAGE_ITEMS.map(item => <button key={item.key} type="button" onClick={() => setActivePage(item.key)} aria-current={activePage === item.key ? 'page' : undefined} className={`flex shrink-0 items-center gap-2 rounded-xl px-3.5 py-2.5 text-left transition whitespace-nowrap ${activePage === item.key ? 'bg-sky-500 text-white shadow-sm' : 'text-slate-600 hover:bg-slate-50 dark:text-slate-300 dark:hover:bg-slate-800'}`}><FileText className="h-4 w-4 shrink-0" /><span className="text-xs sm:text-sm font-semibold">{item.label}</span></button>)}
         </nav>
-        <article className="min-h-80 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-700 dark:bg-slate-900 sm:p-7">
-          <div className="mb-5 border-b border-slate-100 pb-4 dark:border-slate-800"><h2 className="text-xl font-bold text-slate-900 dark:text-white">{selected.label}</h2><p className="mt-1 text-sm text-slate-500 dark:text-slate-400">{selected.description}</p></div>
+        <article className="min-w-0 min-h-80 rounded-2xl border border-slate-200 bg-white p-4 sm:p-7 shadow-sm dark:border-slate-700 dark:bg-slate-900">
+          <div className="mb-5 border-b border-slate-100 pb-4 dark:border-slate-800"><h2 className="text-lg sm:text-xl font-bold text-slate-900 dark:text-white">{selected.label}</h2><p className="mt-1 text-xs sm:text-sm text-slate-500 dark:text-slate-400">{selected.description}</p></div>
           {loading ? <div className="flex min-h-44 items-center justify-center gap-2 text-sm text-slate-500"><Loader2 className="h-5 w-5 animate-spin" />正在加载政策…</div> : editing ? <textarea aria-label={`编辑${selected.label}`} value={draft[activePage]} onChange={event => setDraft(previous => ({ ...previous, [activePage]: event.target.value }))} rows={18} className="w-full resize-y rounded-xl border border-slate-200 bg-slate-50 p-4 text-sm leading-7 text-slate-800 outline-none transition focus:border-sky-400 focus:ring-2 focus:ring-sky-100 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100 dark:focus:ring-sky-900" placeholder={`在此输入${selected.label}内容…`} /> : <div className="min-h-44 whitespace-pre-wrap break-words text-sm leading-7 text-slate-700 dark:text-slate-300">{pages[activePage] || <span className="italic text-slate-400">暂无{selected.label}内容。</span>}</div>}
         </article>
       </div>

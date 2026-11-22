@@ -27,6 +27,7 @@ export const SitesSection: React.FC = () => {
     systemSettings,
     updateSystemSettings,
     uploadFile,
+    deleteUploadedFiles,
     locale,
   } = useApp();
   const tx = (source: string) => translateInline(locale, source);
@@ -144,7 +145,11 @@ export const SitesSection: React.FC = () => {
   const handleDeleteSite = (id: string, title: string, e: React.MouseEvent) => {
     e.stopPropagation();
     if (window.confirm(`确定要移除站点【${title}】吗？`)) {
+      const target = websites.find(s => s.id === id);
       setWebsites(prev => prev.filter(s => s.id !== id));
+      if (target?.poster) {
+        void deleteUploadedFiles([target.poster], { exclude: { websiteIds: [id] } });
+      }
     }
   };
 

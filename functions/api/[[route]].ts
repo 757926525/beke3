@@ -521,6 +521,185 @@ function resolveCloudflareBindings(rawEnv: Record<string, any>) {
   };
 }
 
+function normalizeStorageKeyCandidate(raw: string): string | null {
+  if (!raw) return null;
+  let cleaned = raw.trim().replace(/[)"'`,;]+$/, '');
+  const qIndex = cleaned.indexOf('?');
+  if (qIndex >= 0) cleaned = cleaned.slice(0, qIndex);
+  const hIndex = cleaned.indexOf('#');
+  if (hIndex >= 0) cleaned = cleaned.slice(0, hIndex);
+  try {
+    cleaned = decodeURIComponent(cleaned);
+  } catch {}
+  cleaned = cleaned.replace(/^\/+/, '');
+  if (!cleaned || cleaned.length > 512 || cleaned.includes('..') || cleaned.includes('\0')) {
+    return null;
+  }
+  return cleaned;
+}
+
+function extractStorageKeysFromText(text: string, out: Set<string>): void {
+  if (!text || !text.includes('/api/files/')) return;
+  const regex = /\/api\/files\/([^\s"'<>#?`]+)/gi;
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(text)) !== null) {
+    const normalized = normalizeStorageKeyCandidate(match[1]);
+    if (normalized) out.add(normalized);
+  }
+}
+
+function collectStorageKeysFromValue(value: unknown, out = new Set<string>(), depth = 0): Set<string> {
+  if (depth > 8 || value == null) return out;
+  if (typeof value === 'string') {
+    extractStorageKeysFromText(value, out);
+    return out;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectStorageKeysFromValue(item, out, depth + 1);
+    return out;
+  }
+  if (typeof value === 'object') {
+    for (const val of Object.values(value as Record<string, unknown>)) {
+      collectStorageKeysFromValue(val, out, depth + 1);
+    }
+  }
+  return out;
+}
+
+async function ensureFileOwnersTable(db: any): Promise<void> {
+  if (!db) return;
+  await db.prepare(
+    `CREATE TABLE IF NOT EXISTS fox3_file_owners (
+      key TEXT PRIMARY KEY,
+      ownerId TEXT NOT NULL,
+      createdAt INTEGER NOT NULL
+    )`
+  ).run();
+}
+
+async function recordFileOwner(db: any, key: string, ownerId: string): Promise<void> {
+  if (!db || !key) return;
+  try {
+    await ensureFileOwnersTable(db);
+    await db.prepare(
+      `INSERT INTO fox3_file_owners (key, ownerId, createdAt) VALUES (?, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET ownerId = excluded.ownerId`
+    ).bind(key, ownerId, Date.now()).run();
+  } catch {}
+}
+
+async function collectAllActiveStorageKeys(
+  db: any,
+  overrides?: { siteContent?: any; userMedia?: { userId: string; value: any } },
+): Promise<Set<string>> {
+  const active = new Set<string>();
+  if (!db) return active;
+
+  if (overrides?.siteContent !== undefined) {
+    collectStorageKeysFromValue(overrides.siteContent, active);
+  } else {
+    try {
+      const published = await db.prepare('SELECT value FROM fox3_site_content WHERE id = ?').bind('published').first();
+      if (published?.value) collectStorageKeysFromValue(JSON.parse(String(published.value)), active);
+    } catch {}
+  }
+
+  try {
+    const users = await db.prepare('SELECT userId, value FROM fox3_user_media').all();
+    let overrideApplied = false;
+    for (const row of users?.results || []) {
+      const uid = String(row.userId || '');
+      if (overrides?.userMedia && uid === overrides.userMedia.userId) {
+        collectStorageKeysFromValue(overrides.userMedia.value, active);
+        overrideApplied = true;
+      } else if (row?.value) {
+        try {
+          collectStorageKeysFromValue(JSON.parse(String(row.value)), active);
+        } catch {}
+      }
+    }
+    if (overrides?.userMedia && !overrideApplied) {
+      collectStorageKeysFromValue(overrides.userMedia.value, active);
+    }
+  } catch {}
+
+  for (const extraQuery of [
+    'SELECT content AS v FROM fox3_admin_notebook',
+    'SELECT content AS v FROM fox3_legal_pages',
+    'SELECT value AS v FROM fox3_sync',
+  ]) {
+    try {
+      const rows = await db.prepare(extraQuery).all();
+      for (const row of rows?.results || []) {
+        if (typeof row?.v === 'string') extractStorageKeysFromText(row.v, active);
+      }
+    } catch {}
+  }
+
+  return active;
+}
+
+async function purgeStorageKeyFromBackends(
+  env: any,
+  rawKey: string,
+): Promise<{ removed: boolean; error?: string }> {
+  const key = normalizeStorageKeyCandidate(rawKey);
+  if (!key) return { removed: false, error: '无效的文件路径键' };
+
+  let removed = false;
+  let existedInR2 = false;
+  const bucket = env.R2_BUCKET || env.R2 || env.BUCKET;
+  if (bucket) {
+    try {
+      existedInR2 = Boolean(await bucket.head(key).catch(() => null));
+      await bucket.delete(key);
+      removed = true;
+    } catch (error: any) {
+      console.warn('[Storage] R2 object delete failed:', String(error?.message || error).slice(0, 180));
+      return { removed: false, error: 'R2 文件删除失败；未清理媒体目录' };
+    }
+  }
+
+  const external = getExternalObjectStoreConfig(env);
+  if (external) {
+    try {
+      await deleteExternalObject(external, key);
+      removed = true;
+    } catch (error: any) {
+      console.warn('[Storage] external object delete failed:', String(error?.message || error).slice(0, 180));
+      if (!existedInR2) {
+        return { removed: false, error: `${external.provider.toUpperCase()} 文件删除失败；请检查对象存储删除权限` };
+      }
+    }
+  }
+
+  if (env.DB) {
+    try {
+      await env.DB.prepare('DELETE FROM fox3_files WHERE key = ?').bind(key).run();
+      removed = true;
+    } catch {}
+    try {
+      await env.DB.prepare('DELETE FROM fox3_file_owners WHERE key = ?').bind(key).run();
+    } catch {}
+  }
+
+  const kv = env.KV || env.FOX3_KV;
+  if (kv) {
+    try {
+      await kv.delete(`fox3_file_${key}`);
+      removed = true;
+    } catch {}
+  }
+
+  const memory = (globalThis as any).__fox3_file_store;
+  if (memory?.[key]) {
+    delete memory[key];
+    removed = true;
+  }
+
+  return { removed };
+}
+
 function uint8ArrayToBase64(bytes: Uint8Array): string {
   const chunkSize = 0x8000;
   let binary = '';
@@ -1331,10 +1510,9 @@ export const onRequest = async (context: any) => {
       if (!Number.isInteger(expectedRevision) || expectedRevision < 0) return Response.json({ success: false, error: '个人媒体版本号无效，请重新加载' }, { status: 400, headers });
       const definitions: Record<string, string[]> = {
         books: ['id','title','author','format','cover','description','fileSize','fileUrl','displayFilename','createdAt','updatedAt'],
-        photos: ['id','title','url','originalFilename','thumbnail','category','folderId','folderName','width','height','description','createdAt','updatedAt'],
-        media: ['id','type','title','artist','src','cover','duration','fileSize','uploadedAt','createdAt','updatedAt'],
+        photos: ['id','title','url','originalFilename','thumbnail','category','folderId','folderName','width','height','fileSize','description','createdAt','updatedAt'],
+        media: ['id','type','title','originalFilename','artist','src','cover','duration','fileSize','uploadedAt','createdAt','updatedAt'],
       };
-      const previousData = current?.value ? JSON.parse(String(current.value)) : { books: [], photos: [], media: [] };
       const clean: Record<string, any[]> = {};
       for (const [kind, allowed] of Object.entries(definitions)) {
         const records = Array.isArray(body?.data?.[kind]) ? body.data[kind].slice(0, 2000) : [];
@@ -1352,29 +1530,6 @@ export const onRequest = async (context: any) => {
       }
       const serialized = JSON.stringify(clean);
       if (new TextEncoder().encode(serialized).byteLength > 2 * 1024 * 1024) return Response.json({ success: false, error: '个人媒体目录超过 2 MiB；大文件请使用对象存储链接' }, { status: 413, headers });
-      // Derive removals only from the authenticated user's persisted row; ignore client ownerId.
-      // Legacy upload keys are globally shared, so only the dedicated per-user namespace is deletable.
-      const extractManagedKey = (value: unknown): string | null => {
-        if (typeof value !== 'string' || value.length > 2048) return null;
-        let parsed: URL;
-        try { parsed = new URL(value, url.origin); } catch { return null; }
-        if (parsed.origin !== url.origin || parsed.search || parsed.hash) return null;
-        const match = parsed.pathname.match(/^\/api\/files\/(.+)$/);
-        if (!match) return null;
-        let key = '';
-        try { key = decodeURIComponent(match[1]); } catch { return null; }
-        if (!/^user-media\/[A-Za-z0-9_-]{1,128}\/(?:[^/]{1,180})$/.test(key) || !key.startsWith(`user-media/${user.id}/`)) return null;
-        return key;
-      };
-      const nextPhotoIds = new Set(clean.photos.map(item => item.id));
-      const removedPhotos = (Array.isArray(previousData.photos) ? previousData.photos : []).filter((item: any) => item && typeof item.id === 'string' && !nextPhotoIds.has(item.id));
-      const cleanupKeys = new Set<string>();
-      for (const photo of removedPhotos) for (const value of [photo.url, photo.thumbnail]) {
-        const key = extractManagedKey(value);
-        if (key) cleanupKeys.add(key);
-      }
-      const bucket = env.R2_BUCKET || env.R2 || env.BUCKET;
-      const external = getExternalObjectStoreConfig(env);
       const now = Date.now();
       const result = await env.DB.prepare(`INSERT INTO fox3_user_media (userId, value, revision, updatedAt)
         SELECT ?, ?, 1, ? WHERE ? = 0 OR EXISTS (SELECT 1 FROM fox3_user_media WHERE userId = ?)
@@ -1384,29 +1539,22 @@ export const onRequest = async (context: any) => {
         const latest = await env.DB.prepare('SELECT revision FROM fox3_user_media WHERE userId = ?').bind(user.id).first();
         return Response.json({ success: false, conflict: true, revision: Number(latest?.revision || 0), error: '个人文件已在其他设备更新，请刷新后重试' }, { status: 409, headers });
       }
-      const cleanupFailures: string[] = [];
-      for (const key of cleanupKeys) {
-        let failed = false;
-        if (bucket) try { await bucket.delete(key); } catch (error: any) {
-          failed = true;
-          console.warn('[User Media] R2 object cleanup failed:', String(error?.message || error).slice(0, 180));
-        }
-        if (external) try { await deleteExternalObject(external, key); } catch (error: any) {
-          failed = true;
-          console.warn('[User Media] external object cleanup failed:', String(error?.message || error).slice(0, 180));
-        }
-        // Remove any bounded fallback copy as well; older installs may have persisted the
-        // same generated key in D1/KV or in the current isolate's memory cache.
-        try { await env.DB.prepare('DELETE FROM fox3_files WHERE key = ?').bind(key).run(); } catch {}
-        if (env.KV) try { await env.KV.delete(`fox3_file_${key}`); } catch (error: any) {
-          failed = true;
-          console.warn('[User Media] KV object cleanup failed:', String(error?.message || error).slice(0, 180));
-        }
-        const memoryFiles = (globalThis as any).__fox3_file_store;
-        if (memoryFiles && Object.prototype.hasOwnProperty.call(memoryFiles, key)) delete memoryFiles[key];
-        if (failed) cleanupFailures.push(key);
+      if (current?.value) {
+        try {
+          const prevKeys = collectStorageKeysFromValue(JSON.parse(String(current.value)));
+          const nextKeys = collectStorageKeysFromValue(clean);
+          const removedCandidates = [...prevKeys].filter(k => !nextKeys.has(k));
+          if (removedCandidates.length > 0) {
+            const activeKeys = await collectAllActiveStorageKeys(env.DB, { userMedia: { userId: user.id, value: clean } });
+            for (const k of removedCandidates) {
+              if (!activeKeys.has(k)) {
+                await purgeStorageKeyFromBackends(env, k).catch(() => {});
+              }
+            }
+          }
+        } catch {}
       }
-      return Response.json({ success: true, revision: expectedRevision + 1, updatedAt: now, ...(cleanupFailures.length ? { cleanupPending: true, cleanupFailures: cleanupFailures.length, message: '照片目录已删除，但部分原文件或缩略图清理失败；该项目可能仍可访问，请联系管理员重试。' } : {}) }, { headers });
+      return Response.json({ success: true, revision: expectedRevision + 1, updatedAt: now }, { headers });
     } catch (error: any) {
       console.error('[User Media] D1 operation failed:', String(error?.message || error).slice(0, 180));
       return Response.json({ success: false, error: '个人媒体同步失败，请检查 D1（DB）绑定' }, { status: 503, headers });
@@ -1459,7 +1607,7 @@ export const onRequest = async (context: any) => {
         updatedAt INTEGER NOT NULL
       )`).run();
       const publicFields = ['posts', 'books', 'photos', 'photoFolders', 'media', 'products', 'websites', 'systemSettings', 'themeMode'];
-      const publicSettings = ['siteName', 'headerTagline', 'shopCategories', 'themeColor', 'customPaletteBg', 'fullBackgroundUrl', 'avatarUrl', 'heroIntroImage', 'heroBadge', 'heroTitle', 'heroSubtitle', 'transparentCards', 'bottomButtonsEnabled', 'hideNonBlogForGuests', 'allowUserMediaManagement', 'allowPublicSitesAccess', 'globalTheme', 'deviceView', 'timezone', 'fontFamily', 'customFontName', 'customFontUrl', 'uploadedThemeName'];
+      const publicSettings = ['siteName', 'headerTagline', 'shopCategories', 'themeColor', 'customPaletteBg', 'fullBackgroundUrl', 'avatarUrl', 'heroIntroImage', 'heroBadge', 'heroTitle', 'heroSubtitle', 'transparentCards', 'bottomButtonsEnabled', 'hideNonBlogForGuests', 'allowUserMediaManagement', 'allowPublicSitesAccess', 'globalTheme', 'deviceView', 'mobileTheme', 'timezone', 'fontFamily', 'customFontName', 'customFontUrl', 'uploadedThemeName'];
       const cleanRecords = (value: unknown, kind: string): any[] => {
         if (!Array.isArray(value)) return [];
         const adminUsername = String(env.ADMIN_USERNAME || 'fox').trim().toLowerCase();
@@ -1478,7 +1626,7 @@ export const onRequest = async (context: any) => {
             books: ['id','title','author','format','cover','description','fileSize','fileUrl','displayFilename','createdAt','updatedAt'],
             photos: ['id','title','url','originalFilename','thumbnail','category','folderId','folderName','width','height','fileSize','description','createdAt','updatedAt'],
             photoFolders: ['id','name','createdAt'],
-            media: ['id','type','title','artist','src','cover','duration','fileSize','uploadedAt','createdAt','updatedAt'],
+            media: ['id','type','title','originalFilename','artist','src','cover','duration','fileSize','uploadedAt','createdAt','updatedAt'],
             products: ['id','name','description','price','images','category','stock','tags','showcaseId','createdAt','updatedAt'],
             websites: ['id','title','url','poster','description','createdAt','updatedAt'],
           };
@@ -1558,38 +1706,6 @@ export const onRequest = async (context: any) => {
         const serialized = JSON.stringify(content);
         if (new TextEncoder().encode(serialized).byteLength > 4 * 1024 * 1024) return Response.json({ success: false, error: '站点内容超过 4 MiB；大文件请存入对象存储，仅同步文件链接和元数据' }, { status: 413, headers });
         if (current?.value && String(current.value) === serialized) return Response.json({ success: true, syncedToCloud: true, unchanged: true, revision: Number(current.revision || 1), updatedAt: Number(current.updatedAt || 0) }, { headers });
-        const managedSiteKey = (value: unknown): string | null => {
-          if (typeof value !== 'string' || value.length > 2048) return null;
-          let parsed: URL;
-          try { parsed = new URL(value, url.origin); } catch { return null; }
-          if (parsed.origin !== url.origin || parsed.search || parsed.hash) return null;
-          const match = parsed.pathname.match(/^\/api\/files\/([^/]+)$/);
-          if (!match) return null;
-          let key = '';
-          try { key = decodeURIComponent(match[1]); } catch { return null; }
-          // Only keys generated by the current upload API are eligible. Never infer ownership
-          // for user-media namespaces or legacy/shared object names.
-          if (key.includes('/') || !/^(?:[0-9]{10,13}-[0-9a-f-]{36}-[A-Za-z0-9._-]{1,150}|multipart-[1-9][0-9]*-[0-9]{10,13}-[0-9a-f-]{36}-[A-Za-z0-9._-]{1,150})$/i.test(key)) return null;
-          return key;
-        };
-        const collectObjectKeys = (value: unknown, keys = new Set<string>()): Set<string> => {
-          if (typeof value === 'string') { const key = managedSiteKey(value); if (key) keys.add(key); }
-          else if (Array.isArray(value)) value.forEach(item => collectObjectKeys(item, keys));
-          else if (value && typeof value === 'object') Object.values(value as Record<string, unknown>).forEach(item => collectObjectKeys(item, keys));
-          return keys;
-        };
-        const oldPublic = current?.value ? sanitize(JSON.parse(String(current.value))) : {};
-        const nextPhotoById = new Map((content.photos || []).map((photo: any) => [photo.id, photo]));
-        const cleanupCandidates = new Set<string>();
-        for (const oldPhoto of (oldPublic.photos || []) as any[]) {
-          const nextPhoto: any = nextPhotoById.get(oldPhoto.id);
-          for (const field of ['url', 'thumbnail']) {
-            if (oldPhoto[field] && (!nextPhoto || nextPhoto[field] !== oldPhoto[field])) {
-              const key = managedSiteKey(oldPhoto[field]);
-              if (key) cleanupCandidates.add(key);
-            }
-          }
-        }
         const result = await env.DB.prepare(`INSERT INTO fox3_site_content (id, value, revision, updatedAt)
           SELECT 'published', ?, 1, ? WHERE ? = 0 OR EXISTS (SELECT 1 FROM fox3_site_content WHERE id = 'published')
           ON CONFLICT(id) DO UPDATE SET value = excluded.value, revision = fox3_site_content.revision + 1, updatedAt = excluded.updatedAt
@@ -1599,31 +1715,84 @@ export const onRequest = async (context: any) => {
           return Response.json({ success: false, conflict: true, revision: Number(latest?.revision || 0), error: '站点内容已在其他设备更新。请刷新后再编辑，避免覆盖新内容。' }, { status: 409, headers });
         }
         const saved = await env.DB.prepare('SELECT revision, updatedAt FROM fox3_site_content WHERE id = ?').bind('published').first();
-        const referencedKeys = collectObjectKeys(content);
-        try {
-          const rows = await env.DB.prepare('SELECT value FROM fox3_user_media').all();
-          for (const row of rows?.results || []) try { collectObjectKeys(JSON.parse(String(row.value || '{}')), referencedKeys); } catch {}
-        } catch {}
-        const remainingKeys = [...cleanupCandidates].filter(key => !referencedKeys.has(key));
-        const cleanupFailures: string[] = [];
-        const bucket = env.R2_BUCKET || env.R2 || env.BUCKET;
-        const external = getExternalObjectStoreConfig(env);
-        for (const key of remainingKeys) {
-          let failed = false;
-          if (bucket) try { await bucket.delete(key); } catch (error: any) { failed = true; console.warn('[Site Content] R2 photo cleanup failed:', String(error?.message || error).slice(0, 180)); }
-          if (external) try { await deleteExternalObject(external, key); } catch (error: any) { failed = true; console.warn('[Site Content] external photo cleanup failed:', String(error?.message || error).slice(0, 180)); }
-          try { await env.DB.prepare('DELETE FROM fox3_files WHERE key = ?').bind(key).run(); } catch (error: any) { if (!/no such table/i.test(String(error?.message || error))) failed = true; }
-          if (env.KV) try { await env.KV.delete(`fox3_file_${key}`); } catch { failed = true; }
-          const memoryFiles = (globalThis as any).__fox3_file_store;
-          if (memoryFiles && Object.prototype.hasOwnProperty.call(memoryFiles, key)) delete memoryFiles[key];
-          if (failed) cleanupFailures.push(key);
+        if (current?.value) {
+          try {
+            const prevKeys = collectStorageKeysFromValue(JSON.parse(String(current.value)));
+            const nextKeys = collectStorageKeysFromValue(content);
+            const removedCandidates = [...prevKeys].filter(k => !nextKeys.has(k));
+            if (removedCandidates.length > 0) {
+              const activeKeys = await collectAllActiveStorageKeys(env.DB, { siteContent: content });
+              for (const k of removedCandidates) {
+                if (!activeKeys.has(k)) {
+                  await purgeStorageKeyFromBackends(env, k).catch(() => {});
+                }
+              }
+            }
+          } catch {}
         }
-        return Response.json({ success: true, syncedToCloud: true, revision: Number(saved?.revision || 1), updatedAt: Number(saved?.updatedAt || Date.now()), ...(cleanupFailures.length ? { cleanupPending: true, cleanupFailures: cleanupFailures.length, message: '相册记录已保存，但部分托管原图/缩略图清理失败；文件可能仍可访问，请联系管理员检查存储绑定。' } : {}) }, { headers });
+        return Response.json({ success: true, syncedToCloud: true, revision: Number(saved?.revision || 1), updatedAt: Number(saved?.updatedAt || Date.now()) }, { headers });
       }
       return Response.json({ success: false, error: 'Method not allowed' }, { status: 405, headers });
     } catch (error: any) {
       console.error('[Site Content] Database operation failed:', String(error?.message || error).slice(0, 180));
       return Response.json({ success: false, error: '站点内容数据库操作失败；请检查 Pages 的 DB 绑定及数据库可用性' }, { status: 503, headers });
+    }
+  }
+
+  if (path === '/admin/remove-user-media-items' && request.method === 'POST') {
+    if (!await hasAdminSession(request, env)) {
+      return Response.json({ success: false, error: '仅管理员可执行此操作' }, { status: 401, headers });
+    }
+    if (!env.DB) {
+      return Response.json({ success: true, removedCount: 0 }, { headers });
+    }
+    try {
+      const body = await readJsonRequestLimited(request, 256 * 1024);
+      const itemIds = Array.isArray(body?.itemIds)
+        ? new Set(body.itemIds.map((id: unknown) => String(id || '')).filter(Boolean))
+        : new Set<string>();
+      if (itemIds.size === 0) {
+        return Response.json({ success: true, removedCount: 0 }, { headers });
+      }
+      const rows = await env.DB.prepare('SELECT userId, value FROM fox3_user_media').all();
+      let removedCount = 0;
+      const candidateKeys = new Set<string>();
+      const now = Date.now();
+      for (const row of rows?.results || []) {
+        try {
+          const parsed = JSON.parse(String(row.value || '{}'));
+          let changed = false;
+          for (const kind of ['books', 'photos', 'media']) {
+            if (!Array.isArray(parsed[kind])) continue;
+            const kept = [];
+            for (const entry of parsed[kind]) {
+              if (entry?.id && itemIds.has(String(entry.id))) {
+                removedCount++;
+                changed = true;
+                collectStorageKeysFromValue(entry, candidateKeys);
+              } else {
+                kept.push(entry);
+              }
+            }
+            parsed[kind] = kept;
+          }
+          if (changed) {
+            await env.DB.prepare('UPDATE fox3_user_media SET value = ?, revision = revision + 1, updatedAt = ? WHERE userId = ?')
+              .bind(JSON.stringify(parsed), now, row.userId).run();
+          }
+        } catch {}
+      }
+      if (candidateKeys.size > 0) {
+        const activeKeys = await collectAllActiveStorageKeys(env.DB);
+        for (const k of candidateKeys) {
+          if (!activeKeys.has(k)) {
+            await purgeStorageKeyFromBackends(env, k).catch(() => {});
+          }
+        }
+      }
+      return Response.json({ success: true, removedCount, updatedAt: now }, { headers });
+    } catch (error: any) {
+      return Response.json({ success: false, error: error?.message || '清理用户媒体项失败' }, { status: 500, headers });
     }
   }
 
@@ -1677,7 +1846,7 @@ export const onRequest = async (context: any) => {
       if (data && typeof data === 'object') {
         for (const key of ['posts', 'books', 'photos', 'photoFolders', 'media', 'products', 'websites', 'themeMode', 'webDavBackups', 'webDavMeta', 'webDavConfig']) delete data[key];
         if (data.systemSettings && typeof data.systemSettings === 'object') {
-          for (const key of ['siteName','headerTagline','shopCategories','themeColor','customPaletteBg','fullBackgroundUrl','avatarUrl','heroIntroImage','heroBadge','heroTitle','heroSubtitle','transparentCards','bottomButtonsEnabled','hideNonBlogForGuests','allowPublicSitesAccess','globalTheme','deviceView','timezone','fontFamily','customFontName','customFontUrl']) delete data.systemSettings[key];
+          for (const key of ['siteName','headerTagline','shopCategories','themeColor','customPaletteBg','fullBackgroundUrl','avatarUrl','heroIntroImage','heroBadge','heroTitle','heroSubtitle','transparentCards','bottomButtonsEnabled','hideNonBlogForGuests','allowPublicSitesAccess','globalTheme','deviceView','mobileTheme','timezone','fontFamily','customFontName','customFontUrl']) delete data.systemSettings[key];
         }
       }
       return new Response(JSON.stringify({
@@ -1696,7 +1865,7 @@ export const onRequest = async (context: any) => {
         // Keep the legacy authenticated/private channel separate from canonical public site content and WebDAV.
         for (const key of ['posts', 'books', 'photos', 'photoFolders', 'media', 'products', 'websites', 'themeMode', 'webDavBackups', 'webDavMeta', 'webDavConfig']) delete payload[key];
         if (payload.systemSettings && typeof payload.systemSettings === 'object') {
-          for (const key of ['siteName','headerTagline','shopCategories','themeColor','customPaletteBg','fullBackgroundUrl','avatarUrl','heroIntroImage','heroBadge','heroTitle','heroSubtitle','transparentCards','bottomButtonsEnabled','hideNonBlogForGuests','allowPublicSitesAccess','globalTheme','deviceView','timezone','fontFamily','customFontName','customFontUrl']) delete payload.systemSettings[key];
+          for (const key of ['siteName','headerTagline','shopCategories','themeColor','customPaletteBg','fullBackgroundUrl','avatarUrl','heroIntroImage','heroBadge','heroTitle','heroSubtitle','transparentCards','bottomButtonsEnabled','hideNonBlogForGuests','allowPublicSitesAccess','globalTheme','deviceView','mobileTheme','timezone','fontFamily','customFontName','customFontUrl']) delete payload.systemSettings[key];
         }
         const stringified = JSON.stringify(payload);
         let syncedToCloud = false;
@@ -1742,12 +1911,6 @@ export const onRequest = async (context: any) => {
   // Large uploads are split in the browser into small requests so Pages/Workers request-body
   // limits do not cap the complete file. R2 itself supports multipart objects up to 5 TiB.
   const uploadBucket = env.R2_BUCKET || env.R2 || env.BUCKET;
-  const canAccessMultipartKey = async (key: string) => {
-    const namespace = key.match(/^user-media\/([A-Za-z0-9_-]{1,128})\//);
-    if (!namespace) return true; // Preserve the legacy, non-user-namespaced upload flow.
-    const user = await getAuthenticatedUser(request, env);
-    return Boolean((user && user.id === namespace[1]) || await hasAdminSession(request, env));
-  };
   if (path === '/upload/multipart/create' && request.method === 'POST') {
     if (!uploadBucket) return Response.json({ success: false, error: '大文件分块上传需要绑定 R2_BUCKET 对象存储' }, { status: 503, headers });
     try {
@@ -1759,8 +1922,7 @@ export const onRequest = async (context: any) => {
       const name = String(input.name || 'upload.bin').slice(0, 240);
       if (/\.(html?|xhtml|svg|xml|js|mjs|cjs|wasm|php|phtml|exe|dll|bat|cmd|sh)$/i.test(name) || /^(text\/html|application\/xhtml\+xml|image\/svg\+xml|text\/xml|application\/xml|application\/(javascript|ecmascript|wasm|x-msdownload)|text\/javascript)/i.test(String(input.type || ''))) return Response.json({ success: false, error: '不接受可执行网页、脚本或程序文件' }, { status: 415, headers });
       const safeName = name.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 150) || 'upload.bin';
-      const owner = await getAuthenticatedUser(request, env);
-      const key = `${owner ? `user-media/${owner.id}/` : ''}multipart-${expectedSize}-${Date.now()}-${crypto.randomUUID()}-${safeName}`;
+      const key = `multipart/${expectedSize}/${Date.now()}-${crypto.randomUUID()}-${safeName}`;
       const upload = await uploadBucket.createMultipartUpload(key, { httpMetadata: { contentType: String(input.type || 'application/octet-stream') }, customMetadata: { originalName: encodeURIComponent(name), expectedSize: String(expectedSize), uploadedAt: String(Date.now()) } });
       return Response.json({ success: true, key, uploadId: upload.uploadId, name, type: String(input.type || 'application/octet-stream') }, { headers });
     } catch (error: any) { return Response.json({ success: false, error: error?.message || '无法创建 R2 分块上传' }, { status: 500, headers }); }
@@ -1769,7 +1931,6 @@ export const onRequest = async (context: any) => {
     if (!uploadBucket) return Response.json({ success: false, error: 'R2_BUCKET 未绑定' }, { status: 503, headers });
     const key = url.searchParams.get('key') || '', uploadId = url.searchParams.get('uploadId') || '', partNumber = Number(url.searchParams.get('partNumber'));
     if (!key || !uploadId || !Number.isInteger(partNumber) || partNumber < 1 || partNumber > 10000 || !request.body) return Response.json({ success: false, error: '分块参数缺失或无效' }, { status: 400, headers });
-    if (!await canAccessMultipartKey(key)) return Response.json({ success: false, error: '无权操作其他用户的分块文件' }, { status: 403, headers });
     const contentLength = Number(request.headers.get('content-length') || 0);
     if (contentLength > 8 * 1024 * 1024) return Response.json({ success: false, error: '单个分块不能超过 8 MiB' }, { status: 413, headers });
     try { const part = await uploadBucket.resumeMultipartUpload(key, uploadId).uploadPart(partNumber, request.body); return Response.json({ success: true, part }, { headers }); }
@@ -1777,7 +1938,7 @@ export const onRequest = async (context: any) => {
   }
   if (path === '/upload/multipart/abort' && request.method === 'POST') {
     if (!uploadBucket) return Response.json({ success: false, error: 'R2_BUCKET 未绑定' }, { status: 503, headers });
-    try { const input = await request.json() as { key?: string; uploadId?: string }; if (!input.key || !input.uploadId) return Response.json({ success: false, error: '缺少 key 或 uploadId' }, { status: 400, headers }); if (!await canAccessMultipartKey(input.key)) return Response.json({ success: false, error: '无权操作其他用户的分块文件' }, { status: 403, headers }); await uploadBucket.resumeMultipartUpload(input.key, input.uploadId).abort(); return Response.json({ success: true }, { headers }); }
+    try { const input = await request.json() as { key?: string; uploadId?: string }; if (!input.key || !input.uploadId) return Response.json({ success: false, error: '缺少 key 或 uploadId' }, { status: 400, headers }); await uploadBucket.resumeMultipartUpload(input.key, input.uploadId).abort(); return Response.json({ success: true }, { headers }); }
     catch (error: any) { return Response.json({ success: false, error: error?.message || '无法取消分块上传' }, { status: 502, headers }); }
   }
   if (path === '/upload/multipart/complete' && request.method === 'POST') {
@@ -1785,8 +1946,7 @@ export const onRequest = async (context: any) => {
     try {
       const input = await request.json() as { key?: string; uploadId?: string; parts?: any[]; name?: string; type?: string; size?: number };
       if (!input.key || !input.uploadId || !Array.isArray(input.parts) || !input.parts.length || input.parts.length > 10000) return Response.json({ success: false, error: '分块完成参数无效' }, { status: 400, headers });
-      if (!await canAccessMultipartKey(input.key)) return Response.json({ success: false, error: '无权完成其他用户的分块文件' }, { status: 403, headers });
-      const sizeMatch = /^(?:user-media\/[A-Za-z0-9_-]{1,128}\/)?multipart-([1-9][0-9]*)-[0-9]+-[0-9a-f-]+-[a-zA-Z0-9._-]+$/.exec(input.key);
+      const sizeMatch = /^multipart\/([1-9][0-9]*)\/[0-9]+-[0-9a-f-]+-[a-zA-Z0-9._-]+$/.exec(input.key);
       if (!sizeMatch) return Response.json({ success: false, error: '分块对象键无效' }, { status: 400, headers });
       const multipart = uploadBucket.resumeMultipartUpload(input.key, input.uploadId);
       const expectedSize = Number(sizeMatch[1]);
@@ -1795,6 +1955,11 @@ export const onRequest = async (context: any) => {
       if (!Number.isSafeInteger(expectedSize) || expectedSize < 1 || parts.length !== expectedParts || parts.some((part, index) => part.partNumber !== index + 1 || typeof part.etag !== 'string' || !part.etag)) return Response.json({ success: false, error: '分块清单与初始化时声明的文件大小不一致' }, { status: 400, headers });
       const completed = await multipart.complete(parts);
       if (Number(completed.size) !== expectedSize) return Response.json({ success: false, error: 'R2 完成后的对象大小与文件声明不一致' }, { status: 502, headers });
+      if (env.DB) {
+        const upAdmin = await hasAdminSession(request, env);
+        const upUser = upAdmin ? null : await getAuthenticatedUser(request, env);
+        await recordFileOwner(env.DB, input.key, upAdmin ? 'admin' : (upUser?.id || 'public'));
+      }
       return Response.json({ success: true, key: input.key, url: `/api/files/${encodeURIComponent(input.key)}`, name: String(input.name || 'upload.bin'), size: completed.size, storedTarget: 'r2', type: String(input.type || 'application/octet-stream') }, { headers });
     } catch (error: any) { return Response.json({ success: false, error: error?.message || '无法完成 R2 分块上传' }, { status: 502, headers }); }
   }
@@ -1821,28 +1986,32 @@ export const onRequest = async (context: any) => {
       const canUseD1Fallback = file.size <= 1024 * 1024 && Boolean(env.DB);
       const canUseKvFallback = file.size <= 18 * 1024 * 1024 && Boolean(env.KV);
       const canUseMemoryFallback = file.size <= 4 * 1024 * 1024;
+      const primaryBucket = env.R2_BUCKET || env.R2 || env.BUCKET;
       const externalObjectStore = getExternalObjectStoreConfig(env);
-      if (!env.R2_BUCKET && !externalObjectStore && !canUseD1Fallback && !canUseKvFallback && !canUseMemoryFallback) {
+      if (!primaryBucket && !externalObjectStore && !canUseD1Fallback && !canUseKvFallback && !canUseMemoryFallback) {
         return new Response(JSON.stringify({ success: false, error: '该文件大小需绑定 Cloudflare R2 或配置服务端 COS/OSS/S3-compatible 存储；D1/KV/内存回退无法安全保存此文件' }), { status: 503, headers: { ...Object.fromEntries(headers.entries()), 'Content-Type': 'application/json' } });
       }
 
       const safeFileName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 150) || 'upload.bin';
-      const owner = await getAuthenticatedUser(request, env);
-      const key = `${owner ? `user-media/${owner.id}/` : ''}${Date.now()}-${crypto.randomUUID()}-${safeFileName}`;
+      const key = `${Date.now()}-${crypto.randomUUID()}-${safeFileName}`;
       const contentType = file.type || 'application/octet-stream';
+      const uploadIsAdmin = await hasAdminSession(request, env);
+      const uploadUser = uploadIsAdmin ? null : await getAuthenticatedUser(request, env);
+      const ownerId = uploadIsAdmin ? 'admin' : (uploadUser?.id || 'public');
       let storedTarget = 'none';
 
       // 1. Primary: Cloudflare R2 Storage
-      if (env.R2_BUCKET) {
+      if (primaryBucket) {
         try {
-          await env.R2_BUCKET.put(key, file.stream(), {
+          await primaryBucket.put(key, file.stream(), {
             httpMetadata: {
               contentType,
-              contentDisposition: `inline; filename="${encodeURIComponent(file.name)}"`,
+              contentDisposition: `inline; filename="${safeFileName}"; filename*=UTF-8''${encodeURIComponent(file.name)}`,
             },
             customMetadata: {
               originalName: encodeURIComponent(file.name),
               uploadedAt: String(Date.now()),
+              uploadedBy: ownerId,
             }
           });
           storedTarget = 'r2';
@@ -1927,6 +2096,10 @@ export const onRequest = async (context: any) => {
         return new Response(JSON.stringify({ success: false, error: '文件未保存：请检查 R2 绑定；若配置 COS/OSS/S3-compatible，请核对 provider、Bucket、地域、endpoint、访问密钥与写入权限；小文件还可检查 D1/KV 绑定和可用额度。' }), { status: 503, headers: { ...Object.fromEntries(headers.entries()), 'Content-Type': 'application/json' } });
       }
 
+      if (storedTarget !== 'memory' && env.DB) {
+        await recordFileOwner(env.DB, key, ownerId);
+      }
+
       const publicUrl = `/api/files/${key}`;
       return new Response(JSON.stringify({
         success: true,
@@ -1999,60 +2172,260 @@ export const onRequest = async (context: any) => {
     }
   }
 
+  if (path === '/storage/cleanup-orphans' && request.method === 'POST') {
+    if (!await hasAdminSession(request, env)) {
+      return Response.json({ success: false, error: '仅管理员可执行存储桶残留文件清理' }, { status: 401, headers });
+    }
+    if (!env.DB) {
+      return Response.json({ success: false, error: '需要绑定 D1 数据库 DB 以核对在用文件引用，防止误删' }, { status: 503, headers });
+    }
+    try {
+      const activeKeys = await collectAllActiveStorageKeys(env.DB);
+      const graceCutoff = Date.now() - 5 * 60 * 1000;
+      let deletedCount = 0;
+      let freedBytes = 0;
+      let skippedRecentCount = 0;
+      const bucket = env.R2_BUCKET || env.R2 || env.BUCKET;
+
+      if (bucket) {
+        let cursor: string | undefined;
+        let pages = 0;
+        const staleKeys: Array<{ key: string; size: number }> = [];
+        do {
+          const listed = await bucket.list({ limit: 1000, ...(cursor ? { cursor } : {}) });
+          for (const obj of listed.objects || []) {
+            const k = normalizeStorageKeyCandidate(String(obj.key || ''));
+            if (!k || activeKeys.has(k)) continue;
+            const uploadedAt = obj.uploaded?.getTime?.() || Number(obj.customMetadata?.uploadedAt || 0);
+            if (uploadedAt > graceCutoff) {
+              skippedRecentCount++;
+              continue;
+            }
+            staleKeys.push({ key: k, size: Number(obj.size || 0) });
+          }
+          pages++;
+          cursor = listed.truncated ? listed.cursor : undefined;
+        } while (cursor && pages < 50);
+
+        for (const item of staleKeys) {
+          const purged = await purgeStorageKeyFromBackends(env, item.key);
+          if (purged.removed) {
+            deletedCount++;
+            freedBytes += item.size;
+          }
+        }
+      }
+
+      try {
+        const d1Rows = await env.DB.prepare('SELECT key, size, uploadedAt FROM fox3_files').all();
+        for (const row of d1Rows?.results || []) {
+          const k = normalizeStorageKeyCandidate(String(row.key || ''));
+          if (!k || activeKeys.has(k)) continue;
+          if (Number(row.uploadedAt || 0) > graceCutoff) {
+            skippedRecentCount++;
+            continue;
+          }
+          const purged = await purgeStorageKeyFromBackends(env, k);
+          if (purged.removed) {
+            deletedCount++;
+            freedBytes += Number(row.size || 0);
+          }
+        }
+      } catch {}
+
+      try {
+        const ownerRows = await env.DB.prepare('SELECT key, createdAt FROM fox3_file_owners').all();
+        for (const row of ownerRows?.results || []) {
+          const k = normalizeStorageKeyCandidate(String(row.key || ''));
+          if (!k || activeKeys.has(k)) continue;
+          if (Number(row.createdAt || 0) > graceCutoff) {
+            skippedRecentCount++;
+            continue;
+          }
+          const purged = await purgeStorageKeyFromBackends(env, k);
+          if (purged.removed) deletedCount++;
+        }
+      } catch {}
+
+      const kv = env.KV || env.FOX3_KV;
+      if (kv) {
+        try {
+          const listedKv = await kv.list({ prefix: 'fox3_file_', limit: 1000 });
+          for (const entry of listedKv?.keys || []) {
+            const rawKey = String(entry.name || '').replace(/^fox3_file_/, '');
+            const k = normalizeStorageKeyCandidate(rawKey);
+            if (!k || activeKeys.has(k)) continue;
+            await kv.delete(entry.name);
+            deletedCount++;
+          }
+        } catch {}
+      }
+
+      return Response.json({
+        success: true,
+        deletedCount,
+        freedBytes,
+        skippedRecentCount,
+        message: deletedCount > 0
+          ? `已从存储桶清理 ${deletedCount} 个未被引用的历史残留文件（释放 ${(freedBytes / (1024 * 1024)).toFixed(2)} MB）。`
+          : '存储桶内暂无需要清理的历史残留文件（最近 5 分钟内新上传文件会自动跳过）。',
+      }, { headers: { ...Object.fromEntries(headers.entries()), 'Cache-Control': 'no-store' } });
+    } catch (error: any) {
+      return Response.json({ success: false, error: error?.message || '清理未引用残留文件失败' }, { status: 500, headers });
+    }
+  }
+
   // Universal file stream from R2, configured external object storage, D1, KV, or memory.
   if (path.startsWith('/files/')) {
-    let key = path.replace('/files/', '');
-    try { key = decodeURIComponent(key); } catch {}
+    const rawKey = path.replace(/^\/files\//, '');
+    const key = normalizeStorageKeyCandidate(rawKey);
+    if (!key) return Response.json({ success: false, error: '无效的文件标识' }, { status: 400, headers });
     const isDownload = url.searchParams.get('download') === '1';
 
     if (request.method === 'DELETE') {
-      if (!await hasAdminSession(request, env)) return Response.json({ success: false, error: '仅管理员可删除本站文件' }, { status: 401, headers });
-      let removed = false;
-      const bucket = env.R2_BUCKET || env.R2 || env.BUCKET;
-      if (bucket) try { await bucket.delete(key); removed = true; } catch (error: any) {
-        console.warn('[Storage] R2 object delete failed:', String(error?.message || error).slice(0, 180));
-        return Response.json({ success: false, error: 'R2 文件删除失败；未清理媒体目录' }, { status: 502, headers });
+      const isAdmin = await hasAdminSession(request, env);
+      const authUser = isAdmin ? null : await getAuthenticatedUser(request, env);
+      if (!isAdmin && !authUser) {
+        return Response.json({ success: false, error: '仅管理员或文件所属注册用户可删除本站文件' }, { status: 401, headers });
       }
-      const external = getExternalObjectStoreConfig(env);
-      if (external) try { await deleteExternalObject(external, key); removed = true; } catch (error: any) {
-        console.warn('[Storage] external object delete failed:', String(error?.message || error).slice(0, 180));
-        return Response.json({ success: false, error: `${external.provider.toUpperCase()} 文件删除失败；请检查对象存储删除权限` }, { status: 502, headers });
-      }
-      if (env.DB) {
-        try { await env.DB.prepare('DELETE FROM fox3_files WHERE key = ?').bind(key).run(); removed = true; } catch {}
-        const pathRef = `/api/files/${encodeURIComponent(key)}`;
+
+      const rawRef = `/api/files/${key}`;
+      const encodedRef = `/api/files/${encodeURIComponent(key)}`;
+      const matchesRef = (val: unknown) => {
+        if (typeof val !== 'string' || !val) return false;
+        const normalized = normalizeStorageKeyCandidate(val.replace(/^https?:\/\/[^/]+/i, '').replace(/^\/api\/files\//i, ''));
+        return val === rawRef || val === encodedRef || normalized === key;
+      };
+      const stripRefInText = (text: string) =>
+        text.split(encodedRef).join('').split(rawRef).join('');
+
+      if (!isAdmin && authUser) {
+        if (!env.DB) {
+          return Response.json({ success: false, error: '验证文件归属需要绑定 D1 数据库 DB' }, { status: 403, headers });
+        }
+        let userOwnsFile = false;
+        try {
+          await ensureFileOwnersTable(env.DB);
+          const ownerRow = await env.DB.prepare('SELECT ownerId FROM fox3_file_owners WHERE key = ?').bind(key).first();
+          if (ownerRow && String(ownerRow.ownerId) === authUser.id) userOwnsFile = true;
+        } catch {}
+
+        try {
+          const ownMedia = await env.DB.prepare('SELECT value FROM fox3_user_media WHERE userId = ?').bind(authUser.id).first();
+          if (ownMedia?.value) {
+            const userKeys = collectStorageKeysFromValue(JSON.parse(String(ownMedia.value)));
+            if (userKeys.has(key)) userOwnsFile = true;
+          }
+        } catch {}
+
+        if (!userOwnsFile) {
+          return Response.json({ success: false, error: '无权删除其他用户或管理员的文件' }, { status: 403, headers });
+        }
+
+        // Prevent deleting if admin published site content or another user still references this object
         try {
           const published = await env.DB.prepare('SELECT value FROM fox3_site_content WHERE id = ?').bind('published').first();
-          if (published?.value) {
-            const data = JSON.parse(String(published.value));
-            const clear = (value: any) => typeof value === 'string' ? value.split(pathRef).join('') : value;
-            for (const post of data.posts || []) { if (post.cover === pathRef) post.cover = ''; if (typeof post.content === 'string') post.content = clear(post.content); }
-            for (const book of data.books || []) { if (book.fileUrl === pathRef) book.fileUrl = ''; if (book.cover === pathRef) book.cover = ''; }
-            data.photos = (data.photos || []).filter((item: any) => item.url !== pathRef);
-            data.media = (data.media || []).filter((item: any) => item.src !== pathRef);
-            for (const product of data.products || []) product.images = (product.images || []).filter((image: string) => image !== pathRef);
-            for (const site of data.websites || []) if (site.poster === pathRef) site.poster = '';
-            await env.DB.prepare('UPDATE fox3_site_content SET value = ?, revision = revision + 1, updatedAt = ? WHERE id = ?').bind(JSON.stringify(data), Date.now(), 'published').run();
+          if (published?.value && collectStorageKeysFromValue(JSON.parse(String(published.value))).has(key)) {
+            return Response.json({ success: false, error: '该文件仍被全站公开内容引用，仅管理员可删除' }, { status: 403, headers });
           }
-          const users = await env.DB.prepare('SELECT userId, value FROM fox3_user_media').all();
+          const otherUsers = await env.DB.prepare('SELECT value FROM fox3_user_media WHERE userId != ?').bind(authUser.id).all();
+          for (const row of otherUsers?.results || []) {
+            if (row?.value && collectStorageKeysFromValue(JSON.parse(String(row.value))).has(key)) {
+              return Response.json({ success: false, error: '其他用户仍引用了该文件，暂不从存储桶移除' }, { status: 409, headers });
+            }
+          }
+        } catch {}
+      }
+
+      const purged = await purgeStorageKeyFromBackends(env, key);
+      if (purged.error) {
+        return Response.json({ success: false, error: purged.error }, { status: 502, headers });
+      }
+
+      let siteContentRevision: number | undefined;
+      let siteContentUpdatedAt: number | undefined;
+      let userMediaRevision: number | undefined;
+      let userMediaUpdatedAt: number | undefined;
+      if (env.DB) {
+        try {
+          if (isAdmin) {
+            const published = await env.DB.prepare('SELECT value FROM fox3_site_content WHERE id = ?').bind('published').first();
+            if (published?.value) {
+              const data = JSON.parse(String(published.value));
+              for (const post of data.posts || []) {
+                if (matchesRef(post.cover)) post.cover = '';
+                if (typeof post.content === 'string') post.content = stripRefInText(post.content);
+              }
+              for (const book of data.books || []) {
+                if (matchesRef(book.fileUrl)) book.fileUrl = '';
+                if (matchesRef(book.cover)) book.cover = '';
+              }
+              data.photos = (data.photos || []).filter((item: any) => !matchesRef(item.url) && !matchesRef(item.thumbnail));
+              data.media = (data.media || []).filter((item: any) => !matchesRef(item.src));
+              for (const mediaItem of data.media || []) {
+                if (matchesRef(mediaItem.cover)) mediaItem.cover = '';
+              }
+              for (const product of data.products || []) {
+                if (Array.isArray(product.images)) product.images = product.images.filter((image: string) => !matchesRef(image));
+              }
+              for (const site of data.websites || []) {
+                if (matchesRef(site.poster)) site.poster = '';
+              }
+              if (data.systemSettings && typeof data.systemSettings === 'object') {
+                for (const sKey of ['avatarUrl', 'heroIntroImage', 'fullBackgroundUrl', 'customFontUrl']) {
+                  if (matchesRef(data.systemSettings[sKey])) data.systemSettings[sKey] = '';
+                }
+              }
+              const nowTs = Date.now();
+              await env.DB.prepare('UPDATE fox3_site_content SET value = ?, revision = revision + 1, updatedAt = ? WHERE id = ?')
+                .bind(JSON.stringify(data), nowTs, 'published').run();
+              const updatedSite = await env.DB.prepare('SELECT revision, updatedAt FROM fox3_site_content WHERE id = ?').bind('published').first();
+              if (updatedSite?.revision !== undefined) {
+                siteContentRevision = Number(updatedSite.revision);
+                siteContentUpdatedAt = Number(updatedSite.updatedAt || nowTs);
+              }
+            }
+          }
+
+          const targetUsersQuery = isAdmin
+            ? env.DB.prepare('SELECT userId, value FROM fox3_user_media').all()
+            : env.DB.prepare('SELECT userId, value FROM fox3_user_media WHERE userId = ?').bind(authUser!.id).all();
+          const users = await targetUsersQuery;
           for (const row of users?.results || []) {
             try {
               const data = JSON.parse(String(row.value || '{}'));
-              data.books = (data.books || []).filter((item: any) => item.fileUrl !== pathRef);
-              data.photos = (data.photos || []).filter((item: any) => item.url !== pathRef);
-              data.media = (data.media || []).filter((item: any) => item.src !== pathRef);
-              await env.DB.prepare('UPDATE fox3_user_media SET value = ?, revision = revision + 1, updatedAt = ? WHERE userId = ?').bind(JSON.stringify(data), Date.now(), row.userId).run();
+              data.books = (data.books || []).filter((item: any) => !matchesRef(item.fileUrl));
+              for (const b of data.books || []) if (matchesRef(b.cover)) b.cover = '';
+              data.photos = (data.photos || []).filter((item: any) => !matchesRef(item.url) && !matchesRef(item.thumbnail));
+              data.media = (data.media || []).filter((item: any) => !matchesRef(item.src));
+              for (const m of data.media || []) if (matchesRef(m.cover)) m.cover = '';
+              const nowUserTs = Date.now();
+              await env.DB.prepare('UPDATE fox3_user_media SET value = ?, revision = revision + 1, updatedAt = ? WHERE userId = ?')
+                .bind(JSON.stringify(data), nowUserTs, row.userId).run();
+              if (authUser && row.userId === authUser.id) {
+                const updatedUm = await env.DB.prepare('SELECT revision, updatedAt FROM fox3_user_media WHERE userId = ?').bind(authUser.id).first();
+                if (updatedUm?.revision !== undefined) {
+                  userMediaRevision = Number(updatedUm.revision);
+                  userMediaUpdatedAt = Number(updatedUm.updatedAt || nowUserTs);
+                }
+              }
             } catch {}
           }
         } catch (error: any) {
           console.warn('[Storage] metadata cleanup failed:', String(error?.message || error).slice(0, 180));
         }
       }
-      const kv = env.KV || env.FOX3_KV;
-      if (kv) try { await kv.delete(`fox3_file_${key}`); removed = true; } catch {}
-      const memory = (globalThis as any).__fox3_file_store;
-      if (memory?.[key]) { delete memory[key]; removed = true; }
-      return Response.json({ success: true, removed, key, message: '文件已从可用存储中删除，并清理了站点媒体目录中的引用。' }, { headers: { ...Object.fromEntries(headers.entries()), 'Cache-Control': 'no-store' } });
+
+      return Response.json({
+        success: true,
+        removed: purged.removed,
+        key,
+        siteContentRevision,
+        siteContentUpdatedAt,
+        userMediaRevision,
+        userMediaUpdatedAt,
+        message: '文件已从存储桶及可用存储中删除，并清理了站点媒体目录中的引用。',
+      }, { headers: { ...Object.fromEntries(headers.entries()), 'Cache-Control': 'no-store' } });
     }
     if (request.method !== 'GET' && request.method !== 'HEAD') return new Response('Method not allowed', { status: 405, headers });
 

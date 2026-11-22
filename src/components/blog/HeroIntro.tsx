@@ -4,7 +4,7 @@ import { SafeImage } from '../common/SafeImage';
 import { Sparkles, Camera, HardDrive, Compass, Edit3, Check, X } from 'lucide-react';
 
 export const HeroIntro: React.FC = () => {
-  const { systemSettings, updateSystemSettings, currentUser, uploadFile } = useApp();
+  const { systemSettings, updateSystemSettings, currentUser, uploadFile, deleteUploadedFiles } = useApp();
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const heroSrc = systemSettings.heroIntroImage || '/images/hero-default.jpg';
@@ -20,8 +20,13 @@ export const HeroIntro: React.FC = () => {
   const handleHeroImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    const previousUrl = systemSettings.heroIntroImage;
     const res = await uploadFile(file);
     updateSystemSettings({ heroIntroImage: res.url });
+    if (previousUrl && previousUrl !== res.url) {
+      void deleteUploadedFiles([previousUrl]);
+    }
+    e.target.value = '';
   };
 
   const handleSaveText = () => {

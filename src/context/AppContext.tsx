@@ -29,6 +29,7 @@ import {
   saveLocalStorage,
   saveFileToIndexedDB,
   getFileFromIndexedDB,
+  deleteFileFromIndexedDB,
   DEFAULT_SETTINGS,
   DEFAULT_POSTS,
   DEFAULT_BOOKS,
@@ -131,7 +132,24 @@ interface AppContextType {
   dismissToast: (id: string) => void;
 
   uploadFile: (file: File) => Promise<{ url: string; size: number; name: string }>;
+  deleteUploadedFiles: (
+    urls: Array<string | undefined | null>,
+    options?: {
+      exclude?: {
+        postIds?: string[];
+        bookIds?: string[];
+        photoIds?: string[];
+        mediaIds?: string[];
+        productIds?: string[];
+        websiteIds?: string[];
+      };
+      freedBytes?: number;
+      removedUserItemIds?: string[];
+    }
+  ) => Promise<void>;
+  requestImmediateCloudSync: (removedUserItemIds?: string[]) => void;
   addStorageUsage: (bytes: number) => void;
+  logout: () => void;
 
   deviceMode: DeviceViewMode;
   setDeviceMode: (mode: DeviceViewMode) => void;
@@ -450,12 +468,89 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setTrashItems(prev => prev.filter(t => t.id !== trashId));
   }, [trashItems]);
 
-  const permanentDeleteFromTrash = useCallback((trashId: string) => {
-    setTrashItems(prev => prev.filter(t => t.id !== trashId));
+  const requestImmediateSyncRef = useRef(false);
+  const pendingRemovedUserItemIdsRef = useRef<Set<string>>(new Set());
+
+  const isUrlReferencedElsewhere = useCallback((
+    rawUrl: string,
+    exclude?: {
+      postIds?: string[];
+      bookIds?: string[];
+      photoIds?: string[];
+      mediaIds?: string[];
+      productIds?: string[];
+      websiteIds?: string[];
+    },
+    currentSnapshot?: {
+      posts: Post[];
+      books: Book[];
+      photos: Photo[];
+      media: MediaItem[];
+      products: Product[];
+      websites: WebSiteItem[];
+      systemSettings: SystemSettings;
+    },
+  ): boolean => {
+    const snap = currentSnapshot;
+    if (!snap || !rawUrl) return false;
+    const extractKey = (val: string) => {
+      if (!val) return '';
+      if (val.startsWith('idb_file_')) return val;
+      try {
+        const clean = val.replace(/^https?:\/\/[^/]+/i, '');
+        if (clean.startsWith('/api/files/')) {
+          return decodeURIComponent(clean.slice('/api/files/'.length).split('?')[0]);
+        }
+      } catch {}
+      return val;
+    };
+    const targetKey = extractKey(rawUrl);
+    if (!targetKey) return false;
+    const matches = (val?: string | null) => Boolean(val && (val === rawUrl || extractKey(val) === targetKey));
+
+    const exPost = new Set(exclude?.postIds || []);
+    const exBook = new Set(exclude?.bookIds || []);
+    const exPhoto = new Set(exclude?.photoIds || []);
+    const exMedia = new Set(exclude?.mediaIds || []);
+    const exProduct = new Set(exclude?.productIds || []);
+    const exWebsite = new Set(exclude?.websiteIds || []);
+
+    for (const p of snap.posts) {
+      if (exPost.has(p.id) || p.deleted) continue;
+      if (matches(p.cover) || (typeof p.content === 'string' && (p.content.includes(rawUrl) || p.content.includes(targetKey)))) {
+        return true;
+      }
+    }
+    for (const b of snap.books) {
+      if (exBook.has(b.id) || b.deleted) continue;
+      if (matches(b.fileUrl) || matches(b.cover)) return true;
+    }
+    for (const ph of snap.photos) {
+      if (exPhoto.has(ph.id) || ph.deleted) continue;
+      if (matches(ph.url) || matches(ph.thumbnail)) return true;
+    }
+    for (const m of snap.media) {
+      if (exMedia.has(m.id) || m.deleted) continue;
+      if (matches(m.src) || matches(m.cover)) return true;
+    }
+    for (const pr of snap.products) {
+      if (exProduct.has(pr.id)) continue;
+      if (Array.isArray(pr.images) && pr.images.some(img => matches(img))) return true;
+    }
+    for (const w of snap.websites) {
+      if (exWebsite.has(w.id)) continue;
+      if (matches(w.poster)) return true;
+    }
+    for (const sKey of ['avatarUrl', 'heroIntroImage', 'fullBackgroundUrl', 'customFontUrl'] as const) {
+      if (matches(snap.systemSettings[sKey])) return true;
+    }
+    return false;
   }, []);
 
-  const emptyTrash = useCallback(() => {
-    setTrashItems([]);
+  const logout = useCallback(() => {
+    clearAdminSessionToken();
+    clearUserSessionToken();
+    setCurrentUser(null);
   }, []);
 
   const [systemSettings, setSystemSettings] = useState<SystemSettings>(() =>
@@ -1007,53 +1102,140 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     };
   }, [fetchLatestSiteContent]);
 
+  const latestSiteDataRef = useRef<{
+    posts: Post[];
+    books: Book[];
+    photos: Photo[];
+    photoFolders: Array<{ id: string; name: string; createdAt: number }>;
+    media: MediaItem[];
+    products: Product[];
+    websites: WebSiteItem[];
+    systemSettings: SystemSettings;
+    themeMode: GlobalThemeMode;
+    currentUser: User | null;
+    siteContentNeedsSeed: boolean;
+  }>({
+    posts,
+    books,
+    photos,
+    photoFolders,
+    media,
+    products,
+    websites,
+    systemSettings,
+    themeMode,
+    currentUser,
+    siteContentNeedsSeed,
+  });
+  latestSiteDataRef.current = {
+    posts,
+    books,
+    photos,
+    photoFolders,
+    media,
+    products,
+    websites,
+    systemSettings,
+    themeMode,
+    currentUser,
+    siteContentNeedsSeed,
+  };
+
+  const buildPublicSiteContentPayload = useCallback(() => {
+    const snap = latestSiteDataRef.current;
+    const publicSettingKeys = ['siteName', 'headerTagline', 'shopCategories', 'themeColor', 'customPaletteBg', 'fullBackgroundUrl', 'avatarUrl', 'heroIntroImage', 'heroBadge', 'heroTitle', 'heroSubtitle', 'transparentCards', 'bottomButtonsEnabled', 'hideNonBlogForGuests', 'allowUserMediaManagement', 'allowPublicSitesAccess', 'globalTheme', 'deviceView', 'mobileTheme', 'timezone', 'fontFamily', 'customFontName', 'customFontUrl', 'uploadedThemeName'];
+    const hasLocalUrl = (value: unknown) => typeof value === 'string' && /^(?:idb_file_|data:|blob:)/i.test(value);
+    const removeLocalRefs = (value: string) => value.replace(/(?:idb_file_[\w.-]+|data:[^\s"'<>)]*)/gi, '');
+    const publicSettings = Object.fromEntries(publicSettingKeys.filter(key => (snap.systemSettings as any)[key] !== undefined && !hasLocalUrl((snap.systemSettings as any)[key])).map(key => [key, (snap.systemSettings as any)[key]]));
+    const publicPosts = snap.posts.map(post => ({ ...post, cover: hasLocalUrl(post.cover) ? undefined : post.cover, content: typeof post.content === 'string' ? removeLocalRefs(post.content) : post.content }));
+    const publicBooks = snap.books.filter(book => !hasLocalUrl(book.fileUrl)).map(({ content: _localText, ...book }) => ({ ...book, cover: hasLocalUrl(book.cover) ? undefined : book.cover }));
+    const publicPhotos = snap.photos.filter(photo => !hasLocalUrl(photo.url)).map(photo => ({ ...photo, thumbnail: hasLocalUrl(photo.thumbnail) ? undefined : photo.thumbnail }));
+    const publicMedia = snap.media.filter(item => !hasLocalUrl(item.src)).map(item => ({ ...item, cover: hasLocalUrl(item.cover) ? undefined : item.cover }));
+    const publicProducts = snap.products.map(product => ({ ...product, images: Array.isArray(product.images) ? product.images.filter(url => !hasLocalUrl(url)) : product.images }));
+    const publicWebsites = snap.websites.map(item => ({ ...item, poster: hasLocalUrl(item.poster) ? undefined : item.poster }));
+    const data: Record<string, any> = { posts: publicPosts, books: publicBooks, photos: publicPhotos, photoFolders: snap.photoFolders, media: publicMedia, products: publicProducts, websites: publicWebsites, systemSettings: publicSettings };
+    if (isGlobalThemeMode(snap.themeMode)) data.themeMode = snap.themeMode;
+    return { data, serializedData: JSON.stringify(data) };
+  }, []);
+
+  const persistSiteContentNow = useCallback(async (useKeepalive = false) => {
+    const token = getAdminSessionToken();
+    if (!siteContentReadyRef.current || !token) return;
+    const { data, serializedData } = buildPublicSiteContentPayload();
+    if (serializedData === siteContentLastSavedRef.current && pendingRemovedUserItemIdsRef.current.size === 0) return;
+
+    if (pendingRemovedUserItemIdsRef.current.size > 0) {
+      const removedIds = [...pendingRemovedUserItemIdsRef.current];
+      pendingRemovedUserItemIdsRef.current.clear();
+      try {
+        await fetch('/api/admin/remove-user-media-items', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          body: JSON.stringify({ itemIds: removedIds }),
+          keepalive: useKeepalive,
+        });
+      } catch {}
+    }
+
+    if (serializedData === siteContentLastSavedRef.current) return;
+    setSyncState(prev => ({ ...prev, isSyncing: true, status: 'syncing', message: '正在将管理员发布的站点内容保存至 D1…' }));
+    try {
+      const response = await fetch('/api/site-content', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ expectedRevision: siteContentRevisionRef.current, data }),
+        keepalive: useKeepalive,
+      });
+      const result = await response.json().catch(() => null);
+      if (!response.ok || result?.success !== true || result?.syncedToCloud !== true) {
+        if (response.status === 409) {
+          if (typeof result?.revision === 'number' && result.revision > 0 && requestImmediateSyncRef.current) {
+            siteContentRevisionRef.current = result.revision;
+            const retryRes = await fetch('/api/site-content', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+              body: JSON.stringify({ expectedRevision: siteContentRevisionRef.current, data }),
+              keepalive: useKeepalive,
+            });
+            const retryResult = await retryRes.json().catch(() => null);
+            if (retryRes.ok && retryResult?.success === true && retryResult?.syncedToCloud === true) {
+              siteContentRevisionRef.current = Number(retryResult.revision || siteContentRevisionRef.current);
+              siteContentLastSavedRef.current = serializedData;
+              siteContentConflictRef.current = false;
+              setSiteContentNeedsSeed(false);
+              setSyncState({ isSyncing: false, lastSyncedAt: Number(retryResult.updatedAt || Date.now()), status: 'synced', message: '站点内容已持久保存到 D1' });
+              return;
+            }
+          }
+          siteContentConflictRef.current = true;
+        }
+        throw new Error(result?.error || `站点内容持久化失败 (HTTP ${response.status})`);
+      }
+      siteContentRevisionRef.current = Number(result.revision || siteContentRevisionRef.current);
+      siteContentLastSavedRef.current = serializedData;
+      siteContentConflictRef.current = false;
+      setSiteContentNeedsSeed(false);
+      setSyncState({ isSyncing: false, lastSyncedAt: Number(result.updatedAt || Date.now()), status: 'synced', message: latestSiteDataRef.current.siteContentNeedsSeed ? '站点内容已迁移并持久保存到 D1' : '站点内容已持久保存到 D1' });
+    } catch (error: any) {
+      setSyncState(prev => ({ ...prev, isSyncing: false, status: 'error', message: error?.message || '站点内容保存失败；请刷新后解决版本冲突' }));
+    }
+  }, [buildPublicSiteContentPayload]);
+
   const siteContentTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const siteContentFirstEffectRef = useRef(true);
   useEffect(() => {
     if (siteContentFirstEffectRef.current) { siteContentFirstEffectRef.current = false; return; }
     if (!siteContentReadyRef.current || !getAdminSessionToken()) return;
     if (siteContentTimeoutRef.current) clearTimeout(siteContentTimeoutRef.current);
-    siteContentTimeoutRef.current = setTimeout(async () => {
-      const publicSettingKeys = ['siteName', 'headerTagline', 'shopCategories', 'themeColor', 'customPaletteBg', 'fullBackgroundUrl', 'avatarUrl', 'heroIntroImage', 'heroBadge', 'heroTitle', 'heroSubtitle', 'transparentCards', 'bottomButtonsEnabled', 'hideNonBlogForGuests', 'allowUserMediaManagement', 'allowPublicSitesAccess', 'globalTheme', 'deviceView', 'timezone', 'fontFamily', 'customFontName', 'customFontUrl', 'uploadedThemeName'];
-      const hasLocalUrl = (value: unknown) => typeof value === 'string' && /^(?:idb_file_|data:|blob:)/i.test(value);
-      const removeLocalRefs = (value: string) => value.replace(/(?:idb_file_[\w.-]+|data:[^\s"'<>)]*)/gi, '');
-      const publicSettings = Object.fromEntries(publicSettingKeys.filter(key => (systemSettings as any)[key] !== undefined && !hasLocalUrl((systemSettings as any)[key])).map(key => [key, (systemSettings as any)[key]]));
-      const publicPosts = posts.map(post => ({ ...post, cover: hasLocalUrl(post.cover) ? undefined : post.cover, content: typeof post.content === 'string' ? removeLocalRefs(post.content) : post.content }));
-      const publicBooks = books.filter(book => !hasLocalUrl(book.fileUrl)).map(({ content: _localText, ...book }) => ({ ...book, cover: hasLocalUrl(book.cover) ? undefined : book.cover }));
-      const publicPhotos = photos.filter(photo => !hasLocalUrl(photo.url)).map(photo => ({ ...photo, thumbnail: hasLocalUrl(photo.thumbnail) ? undefined : photo.thumbnail }));
-      const publicMedia = media.filter(item => !hasLocalUrl(item.src)).map(item => ({ ...item, cover: hasLocalUrl(item.cover) ? undefined : item.cover }));
-      const publicProducts = products.map(product => ({ ...product, images: Array.isArray(product.images) ? product.images.filter(url => !hasLocalUrl(url)) : product.images }));
-      const publicWebsites = websites.map(item => ({ ...item, poster: hasLocalUrl(item.poster) ? undefined : item.poster }));
-      const data: Record<string, any> = { posts: publicPosts, books: publicBooks, photos: publicPhotos, photoFolders, media: publicMedia, products: publicProducts, websites: publicWebsites, systemSettings: publicSettings };
-      if (isGlobalThemeMode(themeMode)) data.themeMode = themeMode;
-      const serializedData = JSON.stringify(data);
-      if (serializedData === siteContentLastSavedRef.current) return;
-      setSyncState(prev => ({ ...prev, isSyncing: true, status: 'syncing', message: '正在将管理员发布的站点内容保存至 D1…' }));
-      try {
-        const response = await fetch('/api/site-content', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${getAdminSessionToken()}` },
-          body: JSON.stringify({ expectedRevision: siteContentRevisionRef.current, data }),
-        });
-        const result = await response.json().catch(() => null);
-        if (!response.ok || result?.success !== true || result?.syncedToCloud !== true) {
-          if (response.status === 409) siteContentConflictRef.current = true;
-          throw new Error(result?.error || `站点内容持久化失败 (HTTP ${response.status})`);
-        }
-        siteContentRevisionRef.current = Number(result.revision || siteContentRevisionRef.current);
-        siteContentLastSavedRef.current = serializedData;
-        setSiteContentNeedsSeed(false);
-        if (result.cleanupPending) {
-          setSyncState({ isSyncing: false, lastSyncedAt: Number(result.updatedAt || Date.now()), status: 'error', message: result.message || '相册记录已保存，但部分托管原图/缩略图清理失败。' });
-        } else {
-          setSyncState({ isSyncing: false, lastSyncedAt: Number(result.updatedAt || Date.now()), status: 'synced', message: siteContentNeedsSeed ? '站点内容已迁移并持久保存到 D1' : '站点内容已持久保存到 D1' });
-        }
-      } catch (error: any) {
-        setSyncState(prev => ({ ...prev, isSyncing: false, status: 'error', message: error?.message || '站点内容保存失败；请刷新后解决版本冲突' }));
-      }
-    }, 900);
+    const delay = requestImmediateSyncRef.current ? 0 : 350;
+    siteContentTimeoutRef.current = setTimeout(() => {
+      const wasImmediate = requestImmediateSyncRef.current;
+      void persistSiteContentNow(false).finally(() => {
+        if (wasImmediate) requestImmediateSyncRef.current = false;
+      });
+    }, delay);
     return () => { if (siteContentTimeoutRef.current) clearTimeout(siteContentTimeoutRef.current); };
-  }, [posts, books, photos, photoFolders, media, products, websites, systemSettings, themeMode, currentUser, siteContentNeedsSeed]);
+  }, [posts, books, photos, photoFolders, media, products, websites, systemSettings, themeMode, currentUser, siteContentNeedsSeed, persistSiteContentNow]);
 
   const userMediaSaveTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const userMediaLocalStateRef = useRef({ books, photos, media });
@@ -1107,114 +1289,277 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     return () => { cancelled = true; userMediaReadyRef.current = false; };
   }, [currentUser?.id, currentUser?.username, currentUser?.role]);
 
-  useEffect(() => {
-    if (currentUser?.role !== 'user' || !getUserSessionToken() || !userMediaReadyRef.current) return;
-    const user = currentUser;
+  const buildUserMediaPayload = useCallback(() => {
+    const user = latestSiteDataRef.current.currentUser;
+    if (!user || user.role !== 'user') return null;
+    const snap = userMediaLocalStateRef.current;
     const isOwner = (item: { ownerId?: string; ownerUsername?: string }) => item.ownerId === user.id || (!item.ownerId && item.ownerUsername?.toLowerCase() === user.username.toLowerCase());
     const isLocalFile = (value: unknown) => typeof value === 'string' && /^(?:idb_file_|data:|blob:)/i.test(value);
     const data = {
-      books: books.filter(item => isOwner(item) && !isLocalFile(item.fileUrl)).map(({ content: _localText, ...book }) => book),
-      photos: photos.filter(item => isOwner(item) && !isLocalFile(item.url)),
-      media: media.filter(item => isOwner(item) && !isLocalFile(item.src)),
+      books: snap.books.filter(item => isOwner(item) && !isLocalFile(item.fileUrl)).map(({ content: _localText, ...book }) => book),
+      photos: snap.photos.filter(item => isOwner(item) && !isLocalFile(item.url)),
+      media: snap.media.filter(item => isOwner(item) && !isLocalFile(item.src)),
     };
-    const serialized = JSON.stringify(data);
-    if (serialized === userMediaLastSavedRef.current) return;
-    if (userMediaSaveTimeoutRef.current) clearTimeout(userMediaSaveTimeoutRef.current);
-    userMediaSaveTimeoutRef.current = setTimeout(async () => {
-      const token = getUserSessionToken();
-      try {
-        const response = await fetch('/api/user-media', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-          body: JSON.stringify({ expectedRevision: userMediaRevisionRef.current, data }),
-        });
-        const result = await response.json().catch(() => null);
-        if (!response.ok || result?.success !== true) {
-          const syncError: any = new Error(result?.error || `个人文件同步失败 (HTTP ${response.status})`);
-          syncError.status = response.status;
-          throw syncError;
-        }
-        userMediaRevisionRef.current = Number(result.revision || userMediaRevisionRef.current + 1);
-        userMediaLastSavedRef.current = serialized;
-        userMediaBaseRef.current = data;
-        if (result.cleanupPending) {
-          const warning = result.message || '照片目录已删除，但原文件或缩略图清理未完成；该项目可能仍可访问，请联系管理员。';
-          setSyncState({ isSyncing: false, lastSyncedAt: Number(result.updatedAt || Date.now()), status: 'error', message: warning });
-          showToast(warning, 'error', 7000);
-        } else {
-          setSyncState({ isSyncing: false, lastSyncedAt: Number(result.updatedAt || Date.now()), status: 'synced', message: '个人文件目录已保存到 D1' });
-        }
-      } catch (error: any) {
-        if (error?.status === 409) {
-          try {
-            const latestResponse = await fetch('/api/user-media', { headers: { Authorization: `Bearer ${getUserSessionToken()}`, Accept: 'application/json' }, cache: 'no-store' });
-            const latestEnvelope = await latestResponse.json().catch(() => null);
-            if (latestResponse.ok && latestEnvelope?.success && latestEnvelope.initialized) {
-              const latest = {
-                books: (latestEnvelope.data?.books || []).filter(isOwner),
-                photos: (latestEnvelope.data?.photos || []).filter(isOwner),
-                media: (latestEnvelope.data?.media || []).filter(isOwner),
-              };
-              const localNow = {
-                books: userMediaLocalStateRef.current.books.filter(isOwner),
-                photos: userMediaLocalStateRef.current.photos.filter(isOwner),
-                media: userMediaLocalStateRef.current.media.filter(isOwner),
-              };
-              const mergeChanges = <T extends { id: string }>(baseItems: T[], localItems: T[], remoteItems: T[]) => {
-                const base = new Map(baseItems.map(item => [item.id, item]));
-                const local = new Map(localItems.map(item => [item.id, item]));
-                const remote = new Map(remoteItems.map(item => [item.id, item]));
-                const ids = new Set([...base.keys(), ...local.keys(), ...remote.keys()]);
-                const merged: T[] = [];
-                for (const id of ids) {
-                  const before = base.get(id);
-                  const editedHere = JSON.stringify(local.get(id) ?? null) !== JSON.stringify(before ?? null);
-                  const chosen = editedHere ? local.get(id) : remote.get(id);
-                  if (chosen) merged.push(chosen);
-                }
-                return merged;
-              };
-              const baseline = userMediaBaseRef.current;
-              const rebased = {
-                books: mergeChanges(baseline.books, localNow.books, latest.books),
-                photos: mergeChanges(baseline.photos, localNow.photos, latest.photos),
-                media: mergeChanges(baseline.media, localNow.media, latest.media),
-              };
-              userMediaRevisionRef.current = Number(latestEnvelope.revision || userMediaRevisionRef.current);
-              userMediaBaseRef.current = latest;
-              userMediaLastSavedRef.current = JSON.stringify(latest);
-              const mergeState = <T extends { ownerId?: string; ownerUsername?: string; id: string }>(previous: T[], merged: T[]) => {
-                const localOnly = previous.filter(item => isOwner(item) && ['url', 'src', 'fileUrl'].some(key => isLocalFile((item as any)[key])));
-                const others = previous.filter(item => !isOwner(item));
-                const all = [...others, ...merged, ...localOnly];
-                return all.filter((item, index) => all.findIndex(other => other.id === item.id) === index);
-              };
-              setBooks(prev => mergeState(prev, rebased.books));
-              setPhotos(prev => mergeState(prev, rebased.photos));
-              setMedia(prev => mergeState(prev, rebased.media));
-              setSyncState(prev => ({ ...prev, status: 'syncing', message: '已合并其他设备的文件更新，正在重试保存' }));
-              return;
-            }
-          } catch {}
-        }
-        setSyncState(prev => ({ ...prev, isSyncing: false, status: 'error', message: error?.message || '个人文件同步失败；请刷新后重试' }));
+    return { user, isOwner, isLocalFile, data, serialized: JSON.stringify(data) };
+  }, []);
+
+  const persistUserMediaNow = useCallback(async (useKeepalive = false) => {
+    const token = getUserSessionToken();
+    const payload = buildUserMediaPayload();
+    if (!payload || !token || !userMediaReadyRef.current) return;
+    if (payload.serialized === userMediaLastSavedRef.current) return;
+    try {
+      const response = await fetch('/api/user-media', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ expectedRevision: userMediaRevisionRef.current, data: payload.data }),
+        keepalive: useKeepalive,
+      });
+      const result = await response.json().catch(() => null);
+      if (!response.ok || result?.success !== true) {
+        const syncError: any = new Error(result?.error || `个人文件同步失败 (HTTP ${response.status})`);
+        syncError.status = response.status;
+        throw syncError;
       }
-    }, 800);
+      userMediaRevisionRef.current = Number(result.revision || userMediaRevisionRef.current + 1);
+      userMediaLastSavedRef.current = payload.serialized;
+      userMediaBaseRef.current = payload.data;
+      setSyncState({ isSyncing: false, lastSyncedAt: Number(result.updatedAt || Date.now()), status: 'synced', message: '个人文件目录已保存到 D1' });
+    } catch (error: any) {
+      if (error?.status === 409) {
+        try {
+          const latestResponse = await fetch('/api/user-media', { headers: { Authorization: `Bearer ${getUserSessionToken()}`, Accept: 'application/json' }, cache: 'no-store' });
+          const latestEnvelope = await latestResponse.json().catch(() => null);
+          if (latestResponse.ok && latestEnvelope?.success && latestEnvelope.initialized) {
+            const { isOwner, isLocalFile } = payload;
+            const latest = {
+              books: (latestEnvelope.data?.books || []).filter(isOwner),
+              photos: (latestEnvelope.data?.photos || []).filter(isOwner),
+              media: (latestEnvelope.data?.media || []).filter(isOwner),
+            };
+            const localNow = {
+              books: userMediaLocalStateRef.current.books.filter(isOwner),
+              photos: userMediaLocalStateRef.current.photos.filter(isOwner),
+              media: userMediaLocalStateRef.current.media.filter(isOwner),
+            };
+            const mergeChanges = <T extends { id: string }>(baseItems: T[], localItems: T[], remoteItems: T[]) => {
+              const base = new Map(baseItems.map(item => [item.id, item]));
+              const local = new Map(localItems.map(item => [item.id, item]));
+              const remote = new Map(remoteItems.map(item => [item.id, item]));
+              const ids = new Set([...base.keys(), ...local.keys(), ...remote.keys()]);
+              const merged: T[] = [];
+              for (const id of ids) {
+                const before = base.get(id);
+                const editedHere = JSON.stringify(local.get(id) ?? null) !== JSON.stringify(before ?? null);
+                const chosen = editedHere ? local.get(id) : remote.get(id);
+                if (chosen) merged.push(chosen);
+              }
+              return merged;
+            };
+            const baseline = userMediaBaseRef.current;
+            const rebased = {
+              books: mergeChanges(baseline.books, localNow.books, latest.books),
+              photos: mergeChanges(baseline.photos, localNow.photos, latest.photos),
+              media: mergeChanges(baseline.media, localNow.media, latest.media),
+            };
+            userMediaRevisionRef.current = Number(latestEnvelope.revision || userMediaRevisionRef.current);
+            userMediaBaseRef.current = latest;
+            userMediaLastSavedRef.current = JSON.stringify(latest);
+            const mergeState = <T extends { ownerId?: string; ownerUsername?: string; id: string }>(previous: T[], merged: T[]) => {
+              const localOnly = previous.filter(item => isOwner(item) && ['url', 'src', 'fileUrl'].some(key => isLocalFile((item as any)[key])));
+              const others = previous.filter(item => !isOwner(item));
+              const all = [...others, ...merged, ...localOnly];
+              return all.filter((item, index) => all.findIndex(other => other.id === item.id) === index);
+            };
+            setBooks(prev => mergeState(prev, rebased.books));
+            setPhotos(prev => mergeState(prev, rebased.photos));
+            setMedia(prev => mergeState(prev, rebased.media));
+            setSyncState(prev => ({ ...prev, status: 'syncing', message: '已合并其他设备的文件更新，正在重试保存' }));
+            return;
+          }
+        } catch {}
+      }
+      setSyncState(prev => ({ ...prev, isSyncing: false, status: 'error', message: error?.message || '个人文件同步失败；请刷新后重试' }));
+    }
+  }, [buildUserMediaPayload]);
+
+  useEffect(() => {
+    if (currentUser?.role !== 'user' || !getUserSessionToken() || !userMediaReadyRef.current) return;
+    const payload = buildUserMediaPayload();
+    if (!payload || payload.serialized === userMediaLastSavedRef.current) return;
+    if (userMediaSaveTimeoutRef.current) clearTimeout(userMediaSaveTimeoutRef.current);
+    const delay = requestImmediateSyncRef.current ? 0 : 350;
+    userMediaSaveTimeoutRef.current = setTimeout(() => {
+      const wasImmediate = requestImmediateSyncRef.current;
+      void persistUserMediaNow(false).finally(() => {
+        if (wasImmediate) requestImmediateSyncRef.current = false;
+      });
+    }, delay);
     return () => { if (userMediaSaveTimeoutRef.current) clearTimeout(userMediaSaveTimeoutRef.current); };
-  }, [books, photos, media, currentUser, userMediaRetryKey]);
+  }, [books, photos, media, currentUser, userMediaRetryKey, buildUserMediaPayload, persistUserMediaNow]);
+
+  useEffect(() => {
+    const flushOnLeave = () => {
+      if (siteContentTimeoutRef.current) {
+        clearTimeout(siteContentTimeoutRef.current);
+        siteContentTimeoutRef.current = null;
+      }
+      if (userMediaSaveTimeoutRef.current) {
+        clearTimeout(userMediaSaveTimeoutRef.current);
+        userMediaSaveTimeoutRef.current = null;
+      }
+      void persistSiteContentNow(true);
+      void persistUserMediaNow(true);
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') flushOnLeave();
+    };
+    window.addEventListener('pagehide', flushOnLeave);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      window.removeEventListener('pagehide', flushOnLeave);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
+  }, [persistSiteContentNow, persistUserMediaNow]);
+
+  const requestImmediateCloudSync = useCallback((removedUserItemIds?: string[]) => {
+    if (removedUserItemIds?.length) {
+      for (const id of removedUserItemIds) {
+        if (id) pendingRemovedUserItemIdsRef.current.add(id);
+      }
+    }
+    requestImmediateSyncRef.current = true;
+    if (siteContentTimeoutRef.current) {
+      clearTimeout(siteContentTimeoutRef.current);
+      siteContentTimeoutRef.current = null;
+    }
+    if (userMediaSaveTimeoutRef.current) {
+      clearTimeout(userMediaSaveTimeoutRef.current);
+      userMediaSaveTimeoutRef.current = null;
+    }
+    if (pendingRemovedUserItemIdsRef.current.size > 0 && getAdminSessionToken()) {
+      const ids = [...pendingRemovedUserItemIdsRef.current];
+      pendingRemovedUserItemIdsRef.current.clear();
+      void fetch('/api/admin/remove-user-media-items', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${getAdminSessionToken()}` },
+        body: JSON.stringify({ itemIds: ids }),
+      }).catch(() => {});
+    }
+  }, []);
+
+  const deleteUploadedFiles = useCallback(async (
+    urls: Array<string | undefined | null>,
+    options?: {
+      exclude?: {
+        postIds?: string[];
+        bookIds?: string[];
+        photoIds?: string[];
+        mediaIds?: string[];
+        productIds?: string[];
+        websiteIds?: string[];
+      };
+      freedBytes?: number;
+      removedUserItemIds?: string[];
+    }
+  ) => {
+    requestImmediateCloudSync(options?.removedUserItemIds);
+    const snap = latestSiteDataRef.current;
+    const uniqueUrls = Array.from(new Set(urls.filter((u): u is string => typeof u === 'string' && u.trim().length > 0)));
+    const authToken = getAdminSessionToken() || getUserSessionToken();
+
+    for (const rawUrl of uniqueUrls) {
+      if (/^(?:https?:)?\/\//i.test(rawUrl) && !rawUrl.includes('/api/files/')) continue;
+      if (/^(?:data:|blob:)/i.test(rawUrl)) continue;
+      if (isUrlReferencedElsewhere(rawUrl, options?.exclude, snap)) continue;
+
+      if (rawUrl.startsWith('idb_file_')) {
+        await deleteFileFromIndexedDB(rawUrl);
+        continue;
+      }
+
+      let apiPath = '';
+      if (rawUrl.startsWith('/api/files/')) {
+        apiPath = rawUrl.split('?')[0];
+      } else if (/^https?:\/\/[^/]+\/api\/files\//i.test(rawUrl)) {
+        try {
+          apiPath = new URL(rawUrl).pathname;
+        } catch {}
+      }
+
+      if (apiPath && authToken) {
+        try {
+          const response = await fetch(apiPath, {
+            method: 'DELETE',
+            headers: { Authorization: `Bearer ${authToken}` },
+          });
+          const result = await response.json().catch(() => null);
+          if (response.ok && result?.success) {
+            if (typeof result.siteContentRevision === 'number') {
+              siteContentRevisionRef.current = Math.max(siteContentRevisionRef.current, result.siteContentRevision);
+              siteContentConflictRef.current = false;
+            }
+            if (typeof result.userMediaRevision === 'number') {
+              userMediaRevisionRef.current = Math.max(userMediaRevisionRef.current, result.userMediaRevision);
+            }
+          }
+        } catch (err) {
+          console.warn('[Storage] Failed deleting file from server:', apiPath, err);
+        }
+      }
+    }
+
+    if (options?.freedBytes && options.freedBytes > 0) {
+      addStorageUsage(-options.freedBytes);
+    }
+  }, [isUrlReferencedElsewhere, requestImmediateCloudSync]);
+
+  const permanentDeleteFromTrash = useCallback((trashId: string) => {
+    const target = trashItems.find(t => t.id === trashId);
+    if (target?.data) {
+      const urls: string[] = [];
+      const d = target.data;
+      for (const k of ['url', 'thumbnail', 'fileUrl', 'cover', 'src', 'poster']) {
+        if (typeof d[k] === 'string') urls.push(d[k]);
+      }
+      if (Array.isArray(d.images)) urls.push(...d.images);
+      if (urls.length > 0) {
+        void deleteUploadedFiles(urls, { freedBytes: Number(d.fileSize || 0) || undefined });
+      }
+    }
+    setTrashItems(prev => prev.filter(t => t.id !== trashId));
+  }, [trashItems, deleteUploadedFiles]);
+
+  const emptyTrash = useCallback(() => {
+    const urls: string[] = [];
+    let freed = 0;
+    for (const target of trashItems) {
+      const d = target?.data;
+      if (!d) continue;
+      for (const k of ['url', 'thumbnail', 'fileUrl', 'cover', 'src', 'poster']) {
+        if (typeof d[k] === 'string') urls.push(d[k]);
+      }
+      if (Array.isArray(d.images)) urls.push(...d.images);
+      freed += Number(d.fileSize || 0) || 0;
+    }
+    if (urls.length > 0) {
+      void deleteUploadedFiles(urls, { freedBytes: freed || undefined });
+    }
+    setTrashItems([]);
+  }, [trashItems, deleteUploadedFiles]);
 
   // Robust file upload with real XMLHttpRequest progress tracking & local fallback
   const uploadFile = async (file: File): Promise<{ url: string; size: number; name: string }> => {
     startTransfer('upload', file.name);
-    const uploadToken = currentUser?.role === 'admin' ? getAdminSessionToken() : getUserSessionToken();
-    const uploadHeaders: Record<string, string> = uploadToken ? { Authorization: `Bearer ${uploadToken}` } : {};
+    const uploadToken = getAdminSessionToken() || getUserSessionToken();
+    const authHeaders: Record<string, string> = uploadToken ? { Authorization: `Bearer ${uploadToken}` } : {};
     // Cloudflare's default per-request body ceiling is 100 MB; large files must bypass
     // it using small independently retryable R2 multipart requests.
     if (file.size > 80 * 1024 * 1024) {
       const chunkSize = 8 * 1024 * 1024;
       let uploadId = '', key = '';
       try {
-        const created = await fetch('/api/upload/multipart/create', { method: 'POST', headers: { 'Content-Type': 'application/json', ...uploadHeaders }, body: JSON.stringify({ name: file.name, type: file.type || 'application/octet-stream', size: file.size }) });
+        const created = await fetch('/api/upload/multipart/create', { method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders }, body: JSON.stringify({ name: file.name, type: file.type || 'application/octet-stream', size: file.size }) });
         const init = await created.json();
         if (!created.ok || !init.success) throw new Error(init.error || `R2 分块上传初始化失败 (HTTP ${created.status})`);
         uploadId = init.uploadId; key = init.key;
@@ -1222,20 +1567,20 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         const count = Math.ceil(file.size / chunkSize);
         for (let i = 0; i < count; i++) {
           const partNumber = i + 1;
-          const response = await fetch(`/api/upload/multipart/part?key=${encodeURIComponent(key)}&uploadId=${encodeURIComponent(uploadId)}&partNumber=${partNumber}`, { method: 'PUT', headers: { 'Content-Type': 'application/octet-stream', ...uploadHeaders }, body: file.slice(i * chunkSize, Math.min(file.size, (i + 1) * chunkSize)) });
+          const response = await fetch(`/api/upload/multipart/part?key=${encodeURIComponent(key)}&uploadId=${encodeURIComponent(uploadId)}&partNumber=${partNumber}`, { method: 'PUT', headers: { 'Content-Type': 'application/octet-stream', ...authHeaders }, body: file.slice(i * chunkSize, Math.min(file.size, (i + 1) * chunkSize)) });
           const result = await response.json();
           if (!response.ok || !result.success || !result.part?.etag) throw new Error(result.error || `第 ${partNumber} 个文件分块上传失败`);
           parts.push(result.part);
           updateTransferPercent(Math.min(96, Math.round(((i + 1) / count) * 96)));
         }
-        const completed = await fetch('/api/upload/multipart/complete', { method: 'POST', headers: { 'Content-Type': 'application/json', ...uploadHeaders }, body: JSON.stringify({ key, uploadId, parts, name: file.name, type: file.type || 'application/octet-stream', size: file.size }) });
+        const completed = await fetch('/api/upload/multipart/complete', { method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders }, body: JSON.stringify({ key, uploadId, parts, name: file.name, type: file.type || 'application/octet-stream', size: file.size }) });
         const result = await completed.json();
         if (!completed.ok || !result.success) throw new Error(result.error || 'R2 分块上传未完成');
         addStorageUsage(file.size); updateTransferPercent(100); finishTransfer();
         showToast(`文件《${file.name}》已分块上传至 Cloudflare R2。`, 'success');
         return { url: result.url, size: file.size, name: file.name };
       } catch (error: any) {
-        if (uploadId && key) void fetch('/api/upload/multipart/abort', { method: 'POST', headers: { 'Content-Type': 'application/json', ...uploadHeaders }, body: JSON.stringify({ key, uploadId }) }).catch(() => undefined);
+        if (uploadId && key) void fetch('/api/upload/multipart/abort', { method: 'POST', headers: { 'Content-Type': 'application/json', ...authHeaders }, body: JSON.stringify({ key, uploadId }) }).catch(() => undefined);
         finishTransfer(); showToast(`大文件上传失败：${error?.message || '请检查 R2_BUCKET、R2 访问权限和网络'}`, 'error'); throw error;
       }
     }
@@ -1276,7 +1621,9 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
         const xhr = new XMLHttpRequest();
         xhr.open('POST', '/api/upload', true);
-        if (uploadToken) xhr.setRequestHeader('Authorization', `Bearer ${uploadToken}`);
+        if (uploadToken) {
+          xhr.setRequestHeader('Authorization', `Bearer ${uploadToken}`);
+        }
         // Large videos/photos may take minutes on mobile or remote networks. The old
         // 25-second total timeout silently forced successful-looking IndexedDB fallback.
         xhr.timeout = 10 * 60 * 1000;
@@ -1518,7 +1865,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         showToast,
         dismissToast,
         uploadFile,
+        deleteUploadedFiles,
+        requestImmediateCloudSync,
         addStorageUsage,
+        logout,
         deviceMode,
         setDeviceMode,
         darkMode,

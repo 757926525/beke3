@@ -20,6 +20,7 @@ import {
   FolderPlus,
   MoveRight,
   FolderOpen,
+  Maximize2,
   Eye,
   Loader2,
 } from 'lucide-react';
@@ -35,6 +36,7 @@ export const GallerySection: React.FC = () => {
     setPhotoFolders,
     currentUser,
     uploadFile,
+    deleteUploadedFiles,
     viewModes,
     setViewMode,
     startTransfer,
@@ -56,6 +58,7 @@ export const GallerySection: React.FC = () => {
   const [newFolderName, setNewFolderName] = useState<string>('');
   const [isCreatingFolder, setIsCreatingFolder] = useState<boolean>(false);
   const [targetFolderMove, setTargetFolderMove] = useState<string>('');
+  const [listImageFitContain, setListImageFitContain] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const currentViewMode: ViewMode = viewModes['gallery'] || 'original';
   const canManagePhoto = (photo: Photo) => currentUser?.role === 'admin' || (Boolean(systemSettings.allowUserMediaManagement) && Boolean(currentUser) && ((Boolean(photo.ownerId) && photo.ownerId === currentUser?.id) || (!photo.ownerId && Boolean(photo.ownerUsername) && photo.ownerUsername === currentUser?.username)));
@@ -204,23 +207,41 @@ export const GallerySection: React.FC = () => {
 
   const handleDeletePhoto = (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
-    const prompt = currentUser?.role === 'admin'
-      ? '确认删除此照片吗？删除后会尝试清理存储桶中的原图与缩略图。'
-      : '确认删除自己上传的此照片吗？注册用户只能删除自己上传到相册的图片，不能删除管理员或其他注册用户上传的图片。删除后会尝试清理存储桶中的原图与缩略图。';
-    if (window.confirm(prompt)) {
-      setPhotos(prev => prev.filter(p => p.id !== id || !canManagePhoto(p)));
+    const target = photos.find(p => p.id === id);
+    if (!target || !canManagePhoto(target)) return;
+    if (window.confirm('确认删除此照片吗？')) {
+      const removedUserItemIds = currentUser?.role === 'admin' && target.ownerId && target.ownerId !== currentUser.id
+        ? [target.id]
+        : [];
+      setPhotos(prev => prev.filter(p => p.id !== id));
       if (selectedPhoto?.id === id) setSelectedPhoto(null);
+      void deleteUploadedFiles([target.url, target.thumbnail], {
+        exclude: { photoIds: [id] },
+        freedBytes: Number(target.fileSize) || undefined,
+        removedUserItemIds,
+      });
     }
   };
 
   const handleBatchDelete = () => {
     if (selectedIds.length === 0) return;
-    const prompt = currentUser?.role === 'admin'
-      ? `确认删除选中的 ${selectedIds.length} 张照片吗？删除后会尝试清理存储桶中的原图与缩略图。`
-      : `确认删除选中的 ${selectedIds.length} 张照片吗？注册用户只能删除自己上传到相册的图片，不能删除管理员或其他注册用户上传的图片。删除后会尝试清理存储桶中的原图与缩略图。`;
-    if (window.confirm(prompt)) {
-      setPhotos(prev => prev.filter(p => !selectedIds.includes(p.id) || !canManagePhoto(p)));
+    const targets = photos.filter(p => selectedIds.includes(p.id) && canManagePhoto(p));
+    if (targets.length === 0) return;
+    if (window.confirm(`确认删除选中的 ${targets.length} 张照片吗？`)) {
+      const deletedIds = targets.map(p => p.id);
+      const urls = targets.flatMap(p => [p.url, p.thumbnail]);
+      const freedBytes = targets.reduce((sum, p) => sum + (Number(p.fileSize) || 0), 0);
+      const removedUserItemIds = currentUser?.role === 'admin'
+        ? targets.filter(p => p.ownerId && p.ownerId !== currentUser.id).map(p => p.id)
+        : [];
+      setPhotos(prev => prev.filter(p => !deletedIds.includes(p.id)));
       setSelectedIds([]);
+      if (selectedPhoto && deletedIds.includes(selectedPhoto.id)) setSelectedPhoto(null);
+      void deleteUploadedFiles(urls, {
+        exclude: { photoIds: deletedIds },
+        freedBytes,
+        removedUserItemIds,
+      });
     }
   };
 
@@ -244,10 +265,11 @@ export const GallerySection: React.FC = () => {
       try {
         const resp = await fetch(p.url);
         const blob = await resp.blob();
-        zip.file(`${i + 1}_${p.title.replace(/[^a-zA-Z0-9_\u4e00-\u9fa5-]/g, '_')}.jpg`, blob);
+        const zipEntryName = p.originalFilename || `${i + 1}_${p.title.replace(/[^a-zA-Z0-9_\u4e00-\u9fa5-]/g, '_')}.jpg`;
+        zip.file(zipEntryName, blob);
       } catch {
         // Text stub if CORS blocks cross-origin demo URLs
-        zip.file(`${p.title}.txt`, `URL: ${p.url}\nTitle: ${p.title}`);
+        zip.file(`${p.originalFilename || p.title}.txt`, `URL: ${p.url}\nTitle: ${p.originalFilename || p.title}`);
       }
       updateTransferPercent(Math.round(((i + 1) / targetPhotos.length) * 80));
     }
@@ -339,6 +361,17 @@ export const GallerySection: React.FC = () => {
             >
               <LayoutGrid className="w-3.5 h-3.5" />
             </button>
+            {currentViewMode === 'small' && (
+              <button
+                onClick={() => setListImageFitContain(value => !value)}
+                title={tx(listImageFitContain ? '列表缩略图：完整显示' : '列表缩略图：填满画幅')}
+                aria-label={tx(listImageFitContain ? '切换为裁切填满画幅' : '切换为完整自适应画幅')}
+                aria-pressed={listImageFitContain}
+                className={`p-1.5 rounded-lg transition ${listImageFitContain ? 'bg-white dark:bg-slate-700 text-rose-500 shadow-xs' : 'text-slate-400'}`}
+              >
+                <Maximize2 className="w-3.5 h-3.5" />
+              </button>
+            )}
           </div>
 
           {canUploadPhotos && (
@@ -501,7 +534,6 @@ export const GallerySection: React.FC = () => {
         {filteredPhotos.map(photo => {
           const isSelected = selectedIds.includes(photo.id);
           const listThumbSrc = getDataSaverSrc(photo);
-          const browserOnlyCache = photo.url?.startsWith('idb_file_');
 
           // Small list view
           if (currentViewMode === 'small') {
@@ -528,8 +560,8 @@ export const GallerySection: React.FC = () => {
                       <Square className="w-4 h-4" />
                     )}
                   </button>
-                  <div className="w-16 h-12 border border-slate-200 dark:border-slate-700 overflow-hidden shrink-0 bg-slate-100 dark:bg-slate-800">
-                    <SafeImage src={listThumbSrc} alt={photo.title} className="w-full h-full" imageClassName="object-cover" />
+                  <div className="w-16 h-12 rounded-lg overflow-hidden shrink-0 bg-slate-100 dark:bg-slate-800">
+                    <SafeImage src={listThumbSrc} alt={photo.title} className="w-full h-full" imageClassName={listImageFitContain ? 'object-contain' : 'object-cover'} />
                   </div>
                   <div className="min-w-0">
                     <h4 className="text-xs font-bold text-slate-800 dark:text-slate-100 truncate">
@@ -538,7 +570,6 @@ export const GallerySection: React.FC = () => {
                     <span className="text-[10px] text-slate-400">
                       {photo.width && photo.height ? `${photo.width.toLocaleString()} × ${photo.height.toLocaleString()} px · ` : ''}{new Date(photo.createdAt).toLocaleDateString()}
                     </span>
-                    {browserOnlyCache && <span className="mt-1 inline-block rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-800 dark:bg-amber-900/40 dark:text-amber-200">仅缓存</span>}
                   </div>
                 </div>
 
@@ -569,14 +600,14 @@ export const GallerySection: React.FC = () => {
             <div
               key={photo.id}
               onClick={() => openPhotoModal(photo)}
-              className={`group relative cursor-pointer overflow-hidden border border-slate-200/80 dark:border-slate-800 shadow-sm hover:shadow-xl transition-all duration-300 ${
+              className={`group relative cursor-pointer overflow-hidden rounded-2xl bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 shadow-sm hover:shadow-xl transition-all duration-300 aspect-[4/3] ${
                 isSelected ? 'ring-4 ring-rose-500' : ''
               }`}
             >
               <SafeImage
                 src={listThumbSrc}
                 alt={photo.title}
-                className="block w-full h-auto object-contain transition-transform duration-500 group-hover:scale-[1.02]"
+                className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-105"
               />
 
               {/* Selection Checkbox on Image */}
@@ -586,12 +617,11 @@ export const GallerySection: React.FC = () => {
               >
                 {isSelected ? <CheckSquare className="w-4 h-4 text-white" /> : <Square className="w-4 h-4 text-white/80" />}
               </button>
-              {browserOnlyCache && <span className="absolute bottom-2 left-2 z-10 rounded bg-amber-500/90 px-2 py-1 text-[10px] font-semibold text-white">仅缓存</span>}
 
               {/* Overlay on hover */}
               <div className="absolute inset-0 bg-gradient-to-t from-black/85 via-black/25 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-300 p-4 flex flex-col justify-end">
                 <span className="text-xs font-semibold text-white drop-shadow truncate">
-                  {photo.title}
+                  {photo.originalFilename || photo.title}
                 </span>
                 <span className="text-[10px] text-white/70">
                   {photo.category} • {new Date(photo.createdAt).toLocaleDateString()}
@@ -680,20 +710,11 @@ export const GallerySection: React.FC = () => {
               </button>
               <button
                 onClick={() => setSelectedPhoto(null)}
-                className="hidden sm:block p-2 rounded-full bg-white/10 hover:bg-white/20 text-white transition"
+                className="p-2 rounded-full bg-white/10 hover:bg-white/20 text-white transition"
               >
                 <X className="w-6 h-6" />
               </button>
             </div>
-
-            <button
-              type="button"
-              onClick={e => { e.stopPropagation(); setSelectedPhoto(null); }}
-              aria-label={tx('关闭预览')}
-              className="sm:hidden fixed bottom-5 left-5 z-[60] rounded-full border border-white/25 bg-black/70 p-3 text-white shadow-lg backdrop-blur-md"
-            >
-              <X className="h-6 w-6" />
-            </button>
 
             {/* Left / Prev Arrow */}
             {photos.length > 1 && (
@@ -728,7 +749,7 @@ export const GallerySection: React.FC = () => {
               />
               <div className="mt-3 text-center text-white space-y-1">
                 <div className="flex flex-wrap items-center justify-center gap-2">
-                  <h3 className="text-base font-bold font-serif-sc">{selectedPhoto.title}</h3>
+                  <h3 className="text-base font-bold font-serif-sc break-words">{selectedPhoto.originalFilename || selectedPhoto.title}</h3>
                   {hasDistinctOriginal && !viewingOriginal && (
                     <span className="rounded-full bg-white/15 px-2 py-0.5 text-[10px] text-sky-200">
                       省流极速预览中

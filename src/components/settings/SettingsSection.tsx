@@ -30,11 +30,13 @@ import {
   Clock,
   Type,
   Upload,
+  LogOut,
 } from 'lucide-react';
-import { GlobalThemeMode } from '../../types';
+import { GlobalThemeMode, MobileThemeMode } from '../../types';
 import { translateInline } from '../../utils/i18n';
 import { SiteOwnerChat } from '../guide/SiteOwnerChat';
 import { getAdminSessionToken } from '../../utils/adminSession';
+import { MOBILE_SKINS, getMobileSkinMeta } from '../../utils/mobileSkins';
 
 export const SettingsSection: React.FC = () => {
   const {
@@ -42,9 +44,11 @@ export const SettingsSection: React.FC = () => {
     updateSystemSettings,
     currentUser,
     setCurrentUser,
+    logout,
     deviceMode,
     setDeviceMode,
     uploadFile,
+    deleteUploadedFiles,
     locale,
     t,
     syncState,
@@ -86,6 +90,9 @@ export const SettingsSection: React.FC = () => {
   const [isTranslateSaved, setIsTranslateSaved] = useState(false);
   const [storageUsage, setStorageUsage] = useState<{ r2Bytes: number; r2Files: number; d1FallbackBytes: number; d1FallbackFiles: number; exact: boolean; note: string } | null>(null);
   const [storageLoading, setStorageLoading] = useState(false);
+  const [showMobileSkinPicker, setShowMobileSkinPicker] = useState(false);
+  const [cleaningOrphans, setCleaningOrphans] = useState(false);
+  const activeMobileSkin = getMobileSkinMeta(systemSettings.mobileTheme);
 
   const handleSaveTranslateConfig = () => {
     setTranslateConfig(translateDraft);
@@ -345,25 +352,37 @@ export const SettingsSection: React.FC = () => {
   const handleAvatarUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    const oldAvatar = systemSettings.avatarUrl;
     const res = await uploadFile(file);
     updateSystemSettings({ avatarUrl: res.url });
     if (currentUser?.role === 'admin') {
       setCurrentUser({ ...currentUser, avatar: res.url });
+    }
+    if (oldAvatar && oldAvatar !== res.url) {
+      void deleteUploadedFiles([oldAvatar]);
     }
   };
 
   const handleFullBgUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    const oldBg = systemSettings.fullBackgroundUrl;
     const res = await uploadFile(file);
     updateSystemSettings({ fullBackgroundUrl: res.url });
+    if (oldBg && oldBg !== res.url) {
+      void deleteUploadedFiles([oldBg]);
+    }
   };
 
   const handleHeroBgUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    const oldHero = systemSettings.heroIntroImage;
     const res = await uploadFile(file);
     updateSystemSettings({ heroIntroImage: res.url });
+    if (oldHero && oldHero !== res.url) {
+      void deleteUploadedFiles([oldHero]);
+    }
   };
 
   const handleChangePassword = (e: React.FormEvent) => {
@@ -404,38 +423,104 @@ export const SettingsSection: React.FC = () => {
   return (
     <div className="space-y-6">
       {/* Header Bar */}
-      <div className={`p-5 rounded-3xl border shadow-sm flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 ${
+      <div className={`p-4 sm:p-5 rounded-3xl border shadow-sm space-y-4 ${
         systemSettings.transparentCards
           ? 'bg-white/70 dark:bg-slate-900/70 backdrop-blur-md border-white/20'
           : 'bg-white dark:bg-slate-900 border-slate-200/80 dark:border-slate-800'
       }`}>
-        <div>
-          <h2 className="text-xl font-bold font-serif-sc text-slate-800 dark:text-slate-100 flex items-center gap-2">
-            <Settings className="w-5 h-5 text-sky-500" />
-            <span>系统设置与外观隐私控制中枢</span>
-          </h2>
-          <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
-            全站定制调色、夜间模式、背景照片、隐私保护与存储云盘管理
-          </p>
+        <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+          <div className="min-w-0">
+            <h2 className="text-lg sm:text-xl font-bold font-serif-sc text-slate-800 dark:text-slate-100 flex items-center gap-2">
+              <Settings className="w-5 h-5 text-sky-500 shrink-0" />
+              <span>系统设置与外观隐私控制中枢</span>
+            </h2>
+            <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+              全站定制调色、手机端时尚皮肤、背景照片、隐私保护与存储云盘管理
+            </p>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => {
+                setDeviceMode(deviceMode === 'mobile' ? 'responsive' : 'mobile');
+              }}
+              className="flex items-center gap-1.5 px-3.5 py-2 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 text-xs font-semibold rounded-xl transition min-h-[40px]"
+            >
+              {deviceMode === 'mobile' ? (
+                <Smartphone className="w-4 h-4 text-sky-500 shrink-0" />
+              ) : (
+                <Monitor className="w-4 h-4 text-indigo-500 shrink-0" />
+              )}
+              <span>
+                {deviceMode === 'mobile' ? '手机端视图' : '电脑/响应式视图'}
+              </span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setShowMobileSkinPicker(prev => !prev)}
+              className="flex items-center gap-1.5 px-3.5 py-2 bg-sky-50 dark:bg-sky-950/40 border border-sky-200 dark:border-sky-800 hover:bg-sky-100 text-sky-700 dark:text-sky-300 text-xs font-semibold rounded-xl transition min-h-[40px]"
+              title="选择并切换 6 款时尚手机界面"
+            >
+              <Sparkles className="w-4 h-4 shrink-0" />
+              <span>手机界面切换 · {activeMobileSkin.name}</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={logout}
+              className="flex items-center gap-1.5 px-3.5 py-2 bg-rose-500 hover:bg-rose-600 text-white text-xs font-semibold rounded-xl shadow-xs transition min-h-[40px]"
+            >
+              <LogOut className="w-4 h-4 shrink-0" />
+              <span>退出登录</span>
+            </button>
+          </div>
         </div>
 
-        <div className="flex items-center gap-2">
-          <button
-            onClick={() => {
-              setDeviceMode(deviceMode === 'mobile' ? 'responsive' : 'mobile');
-            }}
-            className="flex items-center gap-1.5 px-3.5 py-2 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-200 text-xs font-semibold rounded-xl transition"
-          >
-            {deviceMode === 'mobile' ? (
-              <Smartphone className="w-4 h-4 text-sky-500" />
-            ) : (
-              <Monitor className="w-4 h-4 text-indigo-500" />
-            )}
-            <span>
-              {deviceMode === 'mobile' ? '手机端视图' : '电脑/响应式视图'}
-            </span>
-          </button>
-        </div>
+        {showMobileSkinPicker && (
+          <div className="pt-3 border-t border-slate-100 dark:border-slate-800 space-y-2.5">
+            <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+              <span className="font-bold text-slate-700 dark:text-slate-200">
+                时尚手机界面皮肤 ({MOBILE_SKINS.length} 款可选，点击立即应用)
+              </span>
+              <span className="text-[11px] text-slate-400">
+                自动切换至手机端预览并同步至全站设置
+              </span>
+            </div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5">
+              {MOBILE_SKINS.map(skin => {
+                const isSelected = activeMobileSkin.id === skin.id;
+                return (
+                  <button
+                    key={skin.id}
+                    type="button"
+                    onClick={() => {
+                      updateSystemSettings({ mobileTheme: skin.id as MobileThemeMode });
+                      setDeviceMode('mobile');
+                      showToast(`已切换手机界面：${skin.name}`, 'success');
+                    }}
+                    className={`p-3 rounded-2xl border text-left transition cursor-pointer ${
+                      isSelected
+                        ? 'border-sky-500 ring-2 ring-sky-500/30 bg-sky-50/70 dark:bg-sky-950/40'
+                        : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 hover:border-sky-400'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-xs font-bold text-slate-800 dark:text-slate-100">{skin.name}</span>
+                      <div className="flex items-center gap-1 shrink-0">
+                        <span className="w-3.5 h-3.5 rounded-full border border-black/15" style={{ backgroundColor: skin.canvas }} title="背景色" />
+                        <span className="w-3.5 h-3.5 rounded-full border border-black/15" style={{ backgroundColor: skin.accent }} title="强调色" />
+                        {isSelected && <Check className="w-3.5 h-3.5 text-sky-500" />}
+                      </div>
+                    </div>
+                    <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-1">{skin.desc}</p>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
       </div>
 
       <section className={`rounded-3xl border border-slate-200 bg-white shadow-sm dark:border-slate-800 dark:bg-slate-900 overflow-hidden`}>
@@ -716,7 +801,11 @@ export const SettingsSection: React.FC = () => {
                 />
                 {systemSettings.fullBackgroundUrl && (
                   <button
-                    onClick={() => updateSystemSettings({ fullBackgroundUrl: '' })}
+                    onClick={() => {
+                      const prev = systemSettings.fullBackgroundUrl;
+                      updateSystemSettings({ fullBackgroundUrl: '' });
+                      if (prev) void deleteUploadedFiles([prev]);
+                    }}
                     className="text-xs text-rose-500 hover:underline"
                   >
                     清除背景
@@ -970,17 +1059,55 @@ export const SettingsSection: React.FC = () => {
 
             {/* Capacity meters from server-side object enumeration */}
             <div className="space-y-3">
-              <div className="flex items-center justify-between">
+              <div className="flex flex-wrap items-center justify-between gap-2">
                 <span className="text-xs font-semibold text-slate-500">容量占用概览</span>
-                <button
-                  type="button"
-                  onClick={() => void refreshStorage()}
-                  disabled={storageLoading}
-                  className="flex items-center gap-1 text-[11px] text-sky-600 dark:text-sky-400 hover:underline disabled:opacity-50"
-                >
-                  <RotateCw className={`w-3 h-3 ${storageLoading ? 'animate-spin' : ''}`} />
-                  <span>{storageLoading ? '正在统计…' : '刷新用量统计'}</span>
-                </button>
+                <div className="flex flex-wrap items-center gap-3">
+                  <button
+                    type="button"
+                    disabled={cleaningOrphans}
+                    onClick={async () => {
+                      const token = getAdminSessionToken();
+                      if (!token) { showToast('需要管理员会话才能清理残留文件', 'error'); return; }
+                      setCleaningOrphans(true);
+                      try {
+                        const res = await fetch('/api/storage/cleanup-orphans', {
+                          method: 'POST',
+                          headers: { Authorization: `Bearer ${token}` },
+                        });
+                        const data = await res.json().catch(() => ({}));
+                        if (!res.ok || data.success === false) {
+                          throw new Error(data.error || `清理失败 (${res.status})`);
+                        }
+                        const deletedCount = Number(data.deletedCount || 0);
+                        const freedMB = ((Number(data.freedBytes || 0)) / (1024 * 1024)).toFixed(2);
+                        showToast(
+                          deletedCount > 0
+                            ? `已清理 ${deletedCount} 个未引用残留文件，释放 ${freedMB} MB 空间`
+                            : '存储桶干净整洁，没有发现未引用的残留文件',
+                          'success'
+                        );
+                        void refreshStorage();
+                      } catch (err: any) {
+                        showToast(err?.message || '清理未引用残留文件失败', 'error');
+                      } finally {
+                        setCleaningOrphans(false);
+                      }
+                    }}
+                    className="flex items-center gap-1 text-[11px] text-rose-600 dark:text-rose-400 hover:underline disabled:opacity-50"
+                  >
+                    <Trash2 className="w-3 h-3" />
+                    <span>{cleaningOrphans ? '正在清理…' : '清理未引用残留文件'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void refreshStorage()}
+                    disabled={storageLoading}
+                    className="flex items-center gap-1 text-[11px] text-sky-600 dark:text-sky-400 hover:underline disabled:opacity-50"
+                  >
+                    <RotateCw className={`w-3 h-3 ${storageLoading ? 'animate-spin' : ''}`} />
+                    <span>{storageLoading ? '正在统计…' : '刷新用量统计'}</span>
+                  </button>
+                </div>
               </div>
               <div className={`grid gap-4 ${deviceMode === 'mobile' ? 'grid-cols-1' : 'grid-cols-1 sm:grid-cols-2'}`}>
                 <div className="p-4 bg-slate-50 dark:bg-slate-800/60 rounded-2xl border border-slate-200 dark:border-slate-700">
@@ -1433,12 +1560,14 @@ export const SettingsSection: React.FC = () => {
                 <button
                   type="button"
                   onClick={async () => {
+                    const oldFontUrl = systemSettings.customFontUrl;
                     await saveFileToIndexedDB('idb_file_fox3_custom_font', '');
                     updateSystemSettings({
                       fontFamily: 'default',
                       customFontName: '',
                       customFontUrl: '',
                     });
+                    if (oldFontUrl) void deleteUploadedFiles([oldFontUrl]);
                     showToast('已恢复默认字体设置', 'info');
                   }}
                   className="px-3 py-2 rounded-xl border border-rose-200 text-rose-600 hover:bg-rose-50 text-xs font-medium dark:border-rose-900 dark:hover:bg-rose-950/30"

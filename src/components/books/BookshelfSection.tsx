@@ -34,8 +34,9 @@ const formatFileSize = (bytes: number) => {
 };
 const bookOriginalFilename = (book: Book) => {
   if (book.displayFilename?.trim()) return book.displayFilename.trim();
-  const fromDescription = book.description?.match(/原文件名[：:]\s*([^\s(]+\.[^\s(]+)/)?.[1];
+  const fromDescription = book.description?.match(/原文件名[：:]\s*(.+?)(?:\s+\(\d+(?:\.\d+)?\s*(?:KB|KiB|MB|MiB|B)\))?$/i)?.[1]?.trim();
   const candidate = fromDescription || book.title;
+  if (/\.[a-z0-9]{1,8}$/i.test(candidate)) return candidate;
   const titleFilename = candidate.match(/^(.+?\.[a-z0-9]{1,8})(?:\s+\(.+\))?$/i)?.[1];
   if (titleFilename) return titleFilename;
   const base = candidate.replace(/\.[^.\s]+$/, '');
@@ -49,6 +50,7 @@ export const BookshelfSection: React.FC = () => {
     setBooks,
     currentUser,
     uploadFile,
+    deleteUploadedFiles,
     startTransfer,
     updateTransferPercent,
     startMultiTransfer,
@@ -140,25 +142,22 @@ export const BookshelfSection: React.FC = () => {
       }
 
       try {
-        const ext = file.name.split('.').pop()?.toUpperCase() || 'TXT';
-        const format = ['EPUB', 'PDF', 'TXT', 'MOBI', 'AZW3'].includes(ext)
-          ? (ext as any)
-          : 'TXT';
+        const extMatch = file.name.match(/\.([a-z0-9]{1,8})$/i);
+        const ext = extMatch ? extMatch[1].toUpperCase() : 'TXT';
+        const format = (['EPUB', 'PDF', 'TXT', 'MOBI', 'AZW3', 'DOCX', 'DOC', 'MD', 'JSON', 'RTF'].includes(ext)
+          ? ext
+          : ext || 'TXT') as any;
 
         const uploaded = await uploadFile(file);
 
         // Extract real text content for preview/reading
         let textContent = '';
-        let detectedTitle = file.name;
 
         if (format === 'EPUB') {
           try {
             const parsed = await parseEpubFile(file);
             if (parsed.fullText && parsed.fullText.length > 30) {
               textContent = parsed.fullText;
-            }
-            if (parsed.title && parsed.title.trim()) {
-              detectedTitle = `${file.name} (${parsed.title.trim()})`;
             }
           } catch (e) {
             console.warn('Failed parsing epub:', e);
@@ -182,7 +181,8 @@ export const BookshelfSection: React.FC = () => {
 
         const createdBook: Book = {
           id: `book-${Date.now()}-${i}`,
-          title: file.name, // Display the exact uploaded filename as requested
+          title: file.name,
+          displayFilename: file.name,
           author: currentUser?.username || 'fox',
           ownerId: currentUser?.id,
           ownerUsername: currentUser?.username,
@@ -236,9 +236,23 @@ export const BookshelfSection: React.FC = () => {
 
   const handleBatchDelete = () => {
     if (selectedIds.length === 0) return;
-    if (window.confirm(`确认批量删除选中的 ${selectedIds.length} 本书籍吗？`)) {
-      setBooks(prev => prev.filter(b => !selectedIds.includes(b.id) || !canManageBook(b)));
+    const deletedBooks = books.filter(b => selectedIds.includes(b.id) && canManageBook(b));
+    if (deletedBooks.length === 0) return;
+    if (window.confirm(`确认批量删除选中的 ${deletedBooks.length} 本书籍吗？`)) {
+      const deletedIds = deletedBooks.map(b => b.id);
+      const urls = deletedBooks.flatMap(b => [b.fileUrl, b.cover]);
+      const freedBytes = deletedBooks.reduce((sum, b) => sum + (Number(b.fileSize) || 0), 0);
+      const removedUserItemIds = currentUser?.role === 'admin'
+        ? deletedBooks.filter(b => b.ownerId && b.ownerId !== currentUser.id).map(b => b.id)
+        : [];
+      setBooks(prev => prev.filter(b => !deletedIds.includes(b.id)));
       setSelectedIds([]);
+      if (readingBook && deletedIds.includes(readingBook.id)) setReadingBook(null);
+      void deleteUploadedFiles(urls, {
+        exclude: { bookIds: deletedIds },
+        freedBytes,
+        removedUserItemIds,
+      });
     }
   };
 
@@ -286,19 +300,31 @@ export const BookshelfSection: React.FC = () => {
 
   const handleDeleteBook = (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
+    const target = books.find(b => b.id === id);
+    if (!target || !canManageBook(target)) return;
     if (window.confirm('确认下架并删除该书籍吗？')) {
-      setBooks(prev => prev.filter(b => b.id !== id || !canManageBook(b)));
+      const removedUserItemIds = currentUser?.role === 'admin' && target.ownerId && target.ownerId !== currentUser.id
+        ? [target.id]
+        : [];
+      setBooks(prev => prev.filter(b => b.id !== id));
       if (readingBook?.id === id) setReadingBook(null);
+      void deleteUploadedFiles([target.fileUrl, target.cover], {
+        exclude: { bookIds: [id] },
+        freedBytes: Number(target.fileSize) || undefined,
+        removedUserItemIds,
+      });
     }
   };
 
   const handleRenameBook = (book: Book, e: React.MouseEvent) => {
     e.stopPropagation();
-    const nextName = window.prompt('设置书架显示文件名（不会重命名底层云存储对象）：', book.displayFilename || bookOriginalFilename(book))?.trim();
+    const currentOriginal = bookOriginalFilename(book);
+    const nextName = window.prompt('设置书架显示文件名（不会重命名底层云存储对象）：', currentOriginal)?.trim();
     if (!nextName) return;
-    const extension = `.${String(book.format || 'txt').toLowerCase()}`;
-    const displayFilename = /\.[a-z0-9]{1,8}$/i.test(nextName) ? nextName : `${nextName}${extension}`;
-    setBooks(previous => previous.map(item => item.id === book.id && canManageBook(item) ? { ...item, displayFilename, updatedAt: Date.now() } : item));
+    const origExtMatch = currentOriginal.match(/(\.[a-z0-9]{1,8})$/i);
+    const fallbackExtension = origExtMatch ? origExtMatch[1].toLowerCase() : `.${String(book.format || 'txt').toLowerCase()}`;
+    const displayFilename = /\.[a-z0-9]{1,8}$/i.test(nextName) ? nextName : `${nextName}${fallbackExtension}`;
+    setBooks(previous => previous.map(item => item.id === book.id && canManageBook(item) ? { ...item, displayFilename, title: displayFilename, updatedAt: Date.now() } : item));
   };
 
   const handleDownload = async (book: Book, e: React.MouseEvent) => {
@@ -371,9 +397,9 @@ export const BookshelfSection: React.FC = () => {
               >
                 <X className="w-5 h-5" />
               </button>
-              <div>
+              <div className="min-w-0">
                 <h3 className="text-sm font-bold truncate max-w-xs sm:max-w-md font-serif-sc">
-                  {readingBook.title}
+                  {bookOriginalFilename(readingBook)}
                 </h3>
                 <span className="text-[10px] text-sky-500 font-medium uppercase tracking-wider">
                   [{readingBook.format}] • {readingBook.author}
@@ -451,7 +477,7 @@ export const BookshelfSection: React.FC = () => {
                   className="font-serif-sc text-stone-800 dark:text-stone-200 select-text whitespace-pre-wrap leading-relaxed py-2 font-normal"
                 >
                   {readingBook.content ||
-                    `${readingBook.title}\n\n该书籍/文档文件格式为 [${readingBook.format}]，已就绪可供在线阅览。无论在手机端或电脑端均支持全屏沉浸式无干扰阅读体验。`}
+                    `${bookOriginalFilename(readingBook)}\n\n该书籍/文档文件格式为 [${readingBook.format}]，已就绪可供在线阅览。无论在手机端或电脑端均支持全屏沉浸式无干扰阅读体验。`}
                 </div>
               </div>
             )}

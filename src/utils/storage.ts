@@ -1,4 +1,4 @@
-import { get, set } from 'idb-keyval';
+import { get, set, del } from 'idb-keyval';
 import {
   Post,
   Book,
@@ -88,6 +88,16 @@ export const getFileFromIndexedDB = async (fileKey: string): Promise<Blob | stri
   }
 };
 
+export const deleteFileFromIndexedDB = async (fileKey: string): Promise<void> => {
+  try {
+    if (fileKey && typeof window !== 'undefined' && 'indexedDB' in window) {
+      await del(fileKey);
+    }
+  } catch (err) {
+    console.warn('[fox3 IDB] IndexedDB delete error:', err);
+  }
+};
+
 // Convert indexedDB key, data URL, or remote URL into a valid URL for displaying/downloading
 export const resolveFileUrl = async (urlOrKey: string): Promise<string> => {
   if (!urlOrKey) return '';
@@ -137,6 +147,7 @@ export const DEFAULT_SETTINGS: SystemSettings = {
   syncIntervalSeconds: 600,
   globalTheme: 'modern',
   deviceView: 'responsive',
+  mobileTheme: 'aurora-mobile',
   fontFamily: 'default',
   customFontName: '',
   customFontUrl: '',

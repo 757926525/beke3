@@ -96,12 +96,12 @@ export const SiteOwnerChat: React.FC<SiteOwnerChatProps> = ({ open, onToggle, de
   };
 
   return (
-    <aside className="rounded-3xl border border-slate-200/80 bg-white shadow-sm dark:border-slate-800 dark:bg-slate-900 overflow-hidden">
+    <section aria-label={tx('站长对话板')} className="rounded-3xl border border-slate-200/80 bg-white shadow-sm dark:border-slate-800 dark:bg-slate-900 overflow-hidden">
       <button
         type="button"
         onClick={handleToggle}
         aria-expanded={isOpen}
-        className="w-full flex items-center justify-between p-5 text-left hover:bg-slate-50/50 dark:hover:bg-slate-800/50 transition"
+        className="w-full flex items-center justify-between p-4 sm:p-5 text-left hover:bg-slate-50/50 dark:hover:bg-slate-800/50 transition"
       >
         <span className="flex items-center gap-2 text-sm font-bold text-slate-900 dark:text-slate-100">
           <MessageCircle className="h-5 w-5 text-sky-500" />
@@ -114,7 +114,7 @@ export const SiteOwnerChat: React.FC<SiteOwnerChatProps> = ({ open, onToggle, de
       </button>
 
       {isOpen && (
-        <div className="px-5 pb-5 border-t border-slate-100 dark:border-slate-800 pt-3">
+        <div className="px-4 sm:px-5 pb-5 border-t border-slate-100 dark:border-slate-800 pt-3">
           <p className="text-xs leading-relaxed text-slate-500">{tx('消息保存于 D1 客服会话。普通用户发送后，管理员页眉消息灯会提醒；管理员可在此选择会话并回复。')}</p>
           {!currentUser && <p className="mt-3 rounded-xl bg-amber-50 p-3 text-xs text-amber-800 dark:bg-amber-950/30 dark:text-amber-200">{tx('请先登录或注册账户后发送消息。访客消息不会伪装成已送达。')}</p>}
           {currentUser && <>
@@ -128,6 +128,6 @@ export const SiteOwnerChat: React.FC<SiteOwnerChatProps> = ({ open, onToggle, de
           {error && <p role="alert" className="mt-2 break-words text-xs text-rose-600">{error}</p>}
         </div>
       )}
-    </aside>
+    </section>
   );
 };

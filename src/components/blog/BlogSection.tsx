@@ -154,8 +154,19 @@ const renderMarkdownContent = (content: string) => {
 };
 
 
+const extractPostMediaUrls = (post?: Partial<Post> | null): string[] => {
+  if (!post) return [];
+  const urls: string[] = [];
+  if (post.cover) urls.push(post.cover);
+  const content = post.content || '';
+  for (const match of content.matchAll(/!\[[^\]]*\]\(([^)]+)\)/g)) {
+    if (match[1]) urls.push(match[1].trim());
+  }
+  return Array.from(new Set(urls.filter(Boolean)));
+};
+
 export const BlogSection: React.FC = () => {
-  const { posts, setPosts, photos, currentUser, uploadFile, viewModes, setViewMode, systemSettings, deviceMode } = useApp();
+  const { posts, setPosts, photos, currentUser, uploadFile, deleteUploadedFiles, viewModes, setViewMode, systemSettings, deviceMode } = useApp();
   const [showGalleryPicker, setShowGalleryPicker] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedCategory, setSelectedCategory] = useState<string>('all');
@@ -206,8 +217,14 @@ export const BlogSection: React.FC = () => {
   const handleBatchDelete = () => {
     if (selectedIds.length === 0) return;
     if (window.confirm(`确认批量删除选中的 ${selectedIds.length} 篇文章吗？`)) {
-      setPosts(prev => prev.filter(p => !selectedIds.includes(p.id)));
+      const deletedPosts = posts.filter(p => selectedIds.includes(p.id) && canDeletePost(p));
+      const deletedIds = deletedPosts.map(p => p.id);
+      const urlsToDelete = Array.from(new Set(deletedPosts.flatMap(p => extractPostMediaUrls(p))));
+      setPosts(prev => prev.filter(p => !deletedIds.includes(p.id)));
       setSelectedIds([]);
+      if (urlsToDelete.length > 0) {
+        void deleteUploadedFiles(urlsToDelete, { exclude: { postIds: deletedIds } });
+      }
     }
   };
 
@@ -283,8 +300,12 @@ export const BlogSection: React.FC = () => {
       return;
     }
     if (window.confirm('确认删除这篇文章吗？')) {
+      const urlsToDelete = extractPostMediaUrls(postToDelete);
       setPosts(prev => prev.filter(p => p.id !== id));
       if (activePost?.id === id) setActivePost(null);
+      if (urlsToDelete.length > 0) {
+        void deleteUploadedFiles(urlsToDelete, { exclude: { postIds: [id] } });
+      }
     }
   };
 
@@ -293,6 +314,9 @@ export const BlogSection: React.FC = () => {
     if (!editingPost.title || !editingPost.content) return;
 
     if (editingPost.id) {
+      const oldPost = posts.find(p => p.id === editingPost.id);
+      const newUrls = new Set(extractPostMediaUrls(editingPost));
+      const removedUrls = extractPostMediaUrls(oldPost).filter(url => !newUrls.has(url));
       setPosts(prev =>
         prev.map(p =>
           p.id === editingPost.id
@@ -306,6 +330,9 @@ export const BlogSection: React.FC = () => {
       );
       if (activePost?.id === editingPost.id) {
         setActivePost({ ...activePost, ...editingPost } as Post);
+      }
+      if (removedUrls.length > 0) {
+        void deleteUploadedFiles(removedUrls, { exclude: { postIds: [editingPost.id] } });
       }
     } else {
       const newP: Post = {
