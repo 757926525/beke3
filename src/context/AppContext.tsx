@@ -1043,7 +1043,11 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         siteContentRevisionRef.current = Number(result.revision || siteContentRevisionRef.current);
         siteContentLastSavedRef.current = serializedData;
         setSiteContentNeedsSeed(false);
-        setSyncState({ isSyncing: false, lastSyncedAt: Number(result.updatedAt || Date.now()), status: 'synced', message: siteContentNeedsSeed ? '站点内容已迁移并持久保存到 D1' : '站点内容已持久保存到 D1' });
+        if (result.cleanupPending) {
+          setSyncState({ isSyncing: false, lastSyncedAt: Number(result.updatedAt || Date.now()), status: 'error', message: result.message || '相册记录已保存，但部分托管原图/缩略图清理失败。' });
+        } else {
+          setSyncState({ isSyncing: false, lastSyncedAt: Number(result.updatedAt || Date.now()), status: 'synced', message: siteContentNeedsSeed ? '站点内容已迁移并持久保存到 D1' : '站点内容已持久保存到 D1' });
+        }
       } catch (error: any) {
         setSyncState(prev => ({ ...prev, isSyncing: false, status: 'error', message: error?.message || '站点内容保存失败；请刷新后解决版本冲突' }));
       }
@@ -1133,7 +1137,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         userMediaRevisionRef.current = Number(result.revision || userMediaRevisionRef.current + 1);
         userMediaLastSavedRef.current = serialized;
         userMediaBaseRef.current = data;
-        setSyncState({ isSyncing: false, lastSyncedAt: Number(result.updatedAt || Date.now()), status: 'synced', message: '个人文件目录已保存到 D1' });
+        if (result.cleanupPending) {
+          const warning = result.message || '照片目录已删除，但原文件或缩略图清理未完成；该项目可能仍可访问，请联系管理员。';
+          setSyncState({ isSyncing: false, lastSyncedAt: Number(result.updatedAt || Date.now()), status: 'error', message: warning });
+          showToast(warning, 'error', 7000);
+        } else {
+          setSyncState({ isSyncing: false, lastSyncedAt: Number(result.updatedAt || Date.now()), status: 'synced', message: '个人文件目录已保存到 D1' });
+        }
       } catch (error: any) {
         if (error?.status === 409) {
           try {
@@ -1196,13 +1206,15 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   // Robust file upload with real XMLHttpRequest progress tracking & local fallback
   const uploadFile = async (file: File): Promise<{ url: string; size: number; name: string }> => {
     startTransfer('upload', file.name);
+    const uploadToken = currentUser?.role === 'admin' ? getAdminSessionToken() : getUserSessionToken();
+    const uploadHeaders: Record<string, string> = uploadToken ? { Authorization: `Bearer ${uploadToken}` } : {};
     // Cloudflare's default per-request body ceiling is 100 MB; large files must bypass
     // it using small independently retryable R2 multipart requests.
     if (file.size > 80 * 1024 * 1024) {
       const chunkSize = 8 * 1024 * 1024;
       let uploadId = '', key = '';
       try {
-        const created = await fetch('/api/upload/multipart/create', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: file.name, type: file.type || 'application/octet-stream', size: file.size }) });
+        const created = await fetch('/api/upload/multipart/create', { method: 'POST', headers: { 'Content-Type': 'application/json', ...uploadHeaders }, body: JSON.stringify({ name: file.name, type: file.type || 'application/octet-stream', size: file.size }) });
         const init = await created.json();
         if (!created.ok || !init.success) throw new Error(init.error || `R2 分块上传初始化失败 (HTTP ${created.status})`);
         uploadId = init.uploadId; key = init.key;
@@ -1210,20 +1222,20 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         const count = Math.ceil(file.size / chunkSize);
         for (let i = 0; i < count; i++) {
           const partNumber = i + 1;
-          const response = await fetch(`/api/upload/multipart/part?key=${encodeURIComponent(key)}&uploadId=${encodeURIComponent(uploadId)}&partNumber=${partNumber}`, { method: 'PUT', headers: { 'Content-Type': 'application/octet-stream' }, body: file.slice(i * chunkSize, Math.min(file.size, (i + 1) * chunkSize)) });
+          const response = await fetch(`/api/upload/multipart/part?key=${encodeURIComponent(key)}&uploadId=${encodeURIComponent(uploadId)}&partNumber=${partNumber}`, { method: 'PUT', headers: { 'Content-Type': 'application/octet-stream', ...uploadHeaders }, body: file.slice(i * chunkSize, Math.min(file.size, (i + 1) * chunkSize)) });
           const result = await response.json();
           if (!response.ok || !result.success || !result.part?.etag) throw new Error(result.error || `第 ${partNumber} 个文件分块上传失败`);
           parts.push(result.part);
           updateTransferPercent(Math.min(96, Math.round(((i + 1) / count) * 96)));
         }
-        const completed = await fetch('/api/upload/multipart/complete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key, uploadId, parts, name: file.name, type: file.type || 'application/octet-stream', size: file.size }) });
+        const completed = await fetch('/api/upload/multipart/complete', { method: 'POST', headers: { 'Content-Type': 'application/json', ...uploadHeaders }, body: JSON.stringify({ key, uploadId, parts, name: file.name, type: file.type || 'application/octet-stream', size: file.size }) });
         const result = await completed.json();
         if (!completed.ok || !result.success) throw new Error(result.error || 'R2 分块上传未完成');
         addStorageUsage(file.size); updateTransferPercent(100); finishTransfer();
         showToast(`文件《${file.name}》已分块上传至 Cloudflare R2。`, 'success');
         return { url: result.url, size: file.size, name: file.name };
       } catch (error: any) {
-        if (uploadId && key) void fetch('/api/upload/multipart/abort', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key, uploadId }) }).catch(() => undefined);
+        if (uploadId && key) void fetch('/api/upload/multipart/abort', { method: 'POST', headers: { 'Content-Type': 'application/json', ...uploadHeaders }, body: JSON.stringify({ key, uploadId }) }).catch(() => undefined);
         finishTransfer(); showToast(`大文件上传失败：${error?.message || '请检查 R2_BUCKET、R2 访问权限和网络'}`, 'error'); throw error;
       }
     }
@@ -1264,6 +1276,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
         const xhr = new XMLHttpRequest();
         xhr.open('POST', '/api/upload', true);
+        if (uploadToken) xhr.setRequestHeader('Authorization', `Bearer ${uploadToken}`);
         // Large videos/photos may take minutes on mobile or remote networks. The old
         // 25-second total timeout silently forced successful-looking IndexedDB fallback.
         xhr.timeout = 10 * 60 * 1000;

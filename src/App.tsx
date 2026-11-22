@@ -139,7 +139,7 @@ const MainLayout: React.FC = () => {
                 onClick={() => setCurrentTab('guide')}
                 className="hover:underline transition text-sky-600 dark:text-sky-400 font-medium"
               >
-                全平台部署指引
+                （说明）
               </button>
             </div>
           </div>

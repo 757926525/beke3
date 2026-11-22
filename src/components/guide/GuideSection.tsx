@@ -31,17 +31,34 @@ export const GuideSection: React.FC = () => {
   };
 
   return (
-    <div className="space-y-6">
+    <div className="mx-auto w-full max-w-4xl min-w-0 space-y-4 px-1 text-sm leading-6 sm:space-y-6 sm:px-0">
       {/* Deployment guide intro */}
       <div className="grid items-start gap-4">
         <div className="space-y-2 rounded-3xl border border-slate-200/80 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900">
-          <h2 className="flex items-center gap-2 font-serif-sc text-xl font-bold text-slate-900 dark:text-slate-100 md:text-2xl"><HelpCircle className="h-6 w-6 text-rose-500"/><span>{tx('fox3 博客全平台极速部署指引与 D1 / R2 / WebDAV 使用说明')}</span></h2>
+          <h2 className="flex items-center gap-2 font-serif-sc text-xl font-bold text-slate-900 dark:text-slate-100 md:text-2xl"><HelpCircle className="h-6 w-6 text-rose-500"/><span>{tx('（说明）')}</span></h2>
           <p className="text-xs leading-relaxed text-slate-500 dark:text-slate-400">{tx('项目存储架构：D1 保存用户/订单/对话/站点结构化内容与文件索引；R2 保存原始图片、视频、电子书等二进制文件；KV 只用于验证码限流等短期数据，不应用作权威内容库。浏览器 localStorage/IndexedDB 仅作缓存和临时草稿。推荐绑定 DB=D1、R2_BUCKET=R2；大文件上传必须使用 R2。')}</p>
           <p className="text-xs leading-relaxed text-slate-500 dark:text-slate-400">{tx('大文件上传需要绑定 Cloudflare R2；本项目当前采用 8 MiB 分块、最多 10,000 块，应用有效上限为 78.125 GiB（约 83.9 GB）；R2 服务自身上限 5 TiB。断线后暂不支持续传，实际仍受对象存储配额、网络与浏览器限制。')}</p>
           <p className="text-xs leading-relaxed text-amber-700 dark:text-amber-300">Policies/法律页面内容为政策草稿，不是自动代写的有效法律意见；发布前请按主体、真实服务及适用法律审查。</p>
         </div>
       </div>
 
+      <section className="grid min-w-0 grid-cols-1 gap-3 sm:grid-cols-2" aria-label="功能使用说明">
+        {[
+          ['登录与注册', '支持用户名密码注册及邮箱验证码注册；忘记密码可用注册邮箱验证码重置。管理员登录依赖服务端 ADMIN_PASSWORD 与 ADMIN_SESSION_SECRET。纯静态托管没有后端 API，不能提供真实账户与鉴权。'],
+          ['设置、主题与字体', '设置区可调整主题配色、背景、透明卡片与隐私选项；提供预置主题和安全的主题 JSON 导入。系统默认字体、楷书、幼圆、秦篆可切换；自定义字体保存在本机 IndexedDB，并可尝试上传到对象存储以便跨设备使用。'],
+          ['博客、书籍、相册与影音', '已发布博客、书架、照片与媒体目录通过全栈后端同步；附件本体需 R2 或兼容对象存储。相册优先加载缩略图，原图按需打开。仅前端静态部署不具备这些服务端同步和上传能力。'],
+          ['商品商城、订单与订单回收站', '管理员可维护商品目录，访客可按站点配置浏览并下单；支付及订单状态更新需要部署对应服务端 API 和支付网关凭据。订单可先移入回收站；在回收站可逐笔恢复或永久删除，也可勾选多笔批量删除。永久删除不可恢复，支付审计记录仍保留。'],
+          ['邮件中枢与同步记事本', '邮件中枢提供发信配置、收信/邮件查看等能力，验证码及业务邮件需要服务端环境变量与邮件供应商配置。同步记事本仅管理员会话可读写，保存到 D1；支持多条文字及图片 URL，图片上传依赖对象存储。'],
+          ['站长对话板、网站与图床', '登录用户可在设置区与站长进行持久对话，消息保存在服务端数据库；支持文字、图片和常见文件附件（单个附件最多 20 MiB，每条消息最多 5 个，合计最多 25 MiB）。图片/文件先上传到已配置的持久对象存储，再以链接发送；若上传只能保存到本机缓存，不能作为跨设备附件发送。网站/图床区用于管理和浏览网址、书签；图床上传和跨设备文件读取依赖后端与对象存储。'],
+          ['备份、支付、部署与存储', 'WebDAV 备份是独立链路，适合小型结构化内容，不应作为大型媒体可靠灾备。Cloudflare Pages 全栈需 Functions、D1（DB）及按需 R2/KV；支付必须另配网关 Secrets。Docker/Node 可提供全栈服务；ESA、Vercel、OSS 等纯静态部署不会自动提供项目 API。'],
+        ].map(([title, body]) => <details key={title} className="min-w-0 overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm dark:border-slate-800 dark:bg-slate-900">
+          <summary className="cursor-pointer list-none px-4 py-3 font-semibold text-slate-900 marker:hidden dark:text-slate-100">{title}<span className="float-right text-sky-600" aria-hidden="true">＋</span></summary>
+          <p className="break-words px-4 pb-4 text-xs leading-6 text-slate-600 dark:text-slate-300">{body}</p>
+        </details>)}
+      </section>
+      <details className="min-w-0 rounded-2xl border border-slate-200 dark:border-slate-800">
+        <summary className="cursor-pointer px-4 py-3 font-semibold">旧版部署、存储额度与服务端配置详解（展开查看）</summary>
+        <div className="min-w-0 space-y-4 overflow-hidden pt-3">
       {/* Storage Free Tiers & Paid Pricing Reference */}
       <section className="rounded-3xl border border-sky-200/80 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900 space-y-4">
         <div className="flex flex-wrap items-center justify-between gap-2">
@@ -165,7 +182,7 @@ export const GuideSection: React.FC = () => {
 
       {/* TAB CONTENT: Cloudflare Pages Git Pull Deploy */}
       {activePlatform === 'cf' && (
-        <div className="bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 rounded-3xl p-6 md:p-8 space-y-6">
+        <div className="min-w-0 overflow-hidden bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 rounded-3xl p-4 sm:p-6 md:p-8 space-y-6">
           <div className="space-y-2">
             <h3 className="text-lg font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
               <Cloud className="w-5 h-5 text-rose-500" />
@@ -312,7 +329,7 @@ export const GuideSection: React.FC = () => {
 
       {/* TAB CONTENT: Direct ZIP Upload Package Instructions */}
       {activePlatform === 'zip' && (
-        <div className="bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 rounded-3xl p-6 md:p-8 space-y-6">
+        <div className="min-w-0 overflow-hidden bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 rounded-3xl p-4 sm:p-6 md:p-8 space-y-6">
           <div className="space-y-2">
             <h3 className="text-lg font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
               <Upload className="w-5 h-5 text-rose-500" />
@@ -362,7 +379,7 @@ export const GuideSection: React.FC = () => {
 
       {/* TAB CONTENT: Tencent Cloud */}
       {activePlatform === 'tencent' && (
-        <div className="bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 rounded-3xl p-6 md:p-8 space-y-6">
+        <div className="min-w-0 overflow-hidden bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 rounded-3xl p-4 sm:p-6 md:p-8 space-y-6">
           <div className="space-y-2">
             <h3 className="text-lg font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
               <Server className="w-5 h-5 text-blue-500" />
@@ -418,7 +435,7 @@ export const GuideSection: React.FC = () => {
 
       {/* TAB CONTENT: Aliyun */}
       {activePlatform === 'aliyun' && (
-        <div className="bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 rounded-3xl p-6 md:p-8 space-y-6">
+        <div className="min-w-0 overflow-hidden bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 rounded-3xl p-4 sm:p-6 md:p-8 space-y-6">
           <div className="space-y-2">
             <h3 className="text-lg font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
               <Server className="w-5 h-5 text-orange-500" />
@@ -476,7 +493,7 @@ export const GuideSection: React.FC = () => {
 
       {/* TAB CONTENT: Vercel, Docker, VPS, 1Panel */}
       {(activePlatform as string) === 'others' && (
-        <div className="bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 rounded-3xl p-6 md:p-8 space-y-6">
+        <div className="min-w-0 overflow-hidden bg-white dark:bg-slate-900 border border-slate-200/80 dark:border-slate-800 rounded-3xl p-4 sm:p-6 md:p-8 space-y-6">
           <div className="space-y-2">
             <h3 className="text-lg font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
               <Server className="w-5 h-5 text-emerald-500" />
@@ -653,6 +670,8 @@ export const GuideSection: React.FC = () => {
           </div>
         </div>
       </section>
+        </div>
+      </details>
     </div>
   );
 };

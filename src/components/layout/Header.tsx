@@ -80,7 +80,7 @@ export const Header: React.FC<HeaderProps> = ({
     { id: 'backup', label: '备份区', icon: Cloud, adminOnly: true },
     { id: 'mail', label: t('nav.mail'), icon: Mail, adminOnly: true },
     { id: 'settings', label: t('nav.settings'), icon: Settings },
-    { id: 'guide', label: t('nav.guide'), icon: HelpCircle },
+    { id: 'guide', label: locale.startsWith('zh') ? '（说明）' : t('nav.guide'), icon: HelpCircle },
   ];
 
   const filteredNavItems = navItems.filter(item => {
@@ -252,7 +252,7 @@ export const Header: React.FC<HeaderProps> = ({
                 <button
                   onClick={handleLogout}
                   title={t('header.logout')}
-                  className="p-2 rounded-lg text-slate-500 hover:text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950/30 transition"
+                  className="hidden md:inline-flex p-2 rounded-lg text-slate-500 hover:text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950/30 transition"
                 >
                   <LogOut className="w-4 h-4" />
                 </button>
@@ -361,6 +361,17 @@ export const Header: React.FC<HeaderProps> = ({
           })}
         </div>
       )}
-    </header>
+      {currentUser && (
+        <button
+          type="button"
+          onClick={handleLogout}
+          title={t('header.logout')}
+          className="fixed bottom-[max(1rem,env(safe-area-inset-bottom))] left-4 z-[70] inline-flex items-center gap-2 rounded-full bg-rose-600 px-4 py-3 text-sm font-semibold text-white shadow-lg shadow-rose-950/25 md:hidden"
+        >
+          <LogOut className="h-4 w-4" />
+          <span>退出</span>
+        </button>
+      )}
+      </header>
   );
 };
