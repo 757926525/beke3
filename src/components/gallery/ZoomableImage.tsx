@@ -1,5 +1,4 @@
 import React, { useRef, useState } from 'react';
-import { Minus, Plus, RotateCcw } from 'lucide-react';
 import { Locale, translateInline } from '../../utils/i18n';
 
 type Point = { x: number; y: number };
@@ -72,12 +71,6 @@ export const ZoomableImage: React.FC<ZoomableImageProps> = ({ src, alt, locale, 
 
   return (
     <div className="flex max-h-[82vh] max-w-[96vw] flex-col items-center gap-2" onClick={event => event.stopPropagation()}>
-      <div className="flex items-center gap-2 text-white">
-        <button type="button" aria-label={tx('缩小图片')} title={tx('缩小')} onClick={() => setScale(value => clampScale(value - 0.5))} className="rounded-full bg-white/10 p-2 hover:bg-white/20"><Minus className="h-4 w-4" /></button>
-        <span className="min-w-12 text-center text-xs tabular-nums">{Math.round(scale * 100)}%</span>
-        <button type="button" aria-label={tx('放大图片')} title={tx('放大')} onClick={() => setScale(value => clampScale(value + 0.5))} className="rounded-full bg-white/10 p-2 hover:bg-white/20"><Plus className="h-4 w-4" /></button>
-        <button type="button" aria-label={tx('重置缩放')} title={tx('重置')} onClick={reset} className="rounded-full bg-white/10 p-2 hover:bg-white/20"><RotateCcw className="h-4 w-4" /></button>
-      </div>
       <div className="flex max-h-[75vh] max-w-[96vw] items-center justify-center overflow-hidden rounded-xl">
         <img
           src={src}

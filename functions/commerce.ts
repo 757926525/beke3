@@ -231,7 +231,7 @@ export async function handleCommerceRequest(
   headers: Headers,
   auth: CommerceAuth,
 ): Promise<Response | null> {
-  const matchOrder = path.match(/^\/orders\/([^/]+)(?:\/(cancel|capture|pay|verify|ship|refund|restore))?$/);
+  const matchOrder = path.match(/^\/orders\/([^/]+)(?:\/(cancel|capture|pay|verify|ship|refund|restore|delete-permanent))?$/);
   const isCommercePath = path === '/orders' || path === '/orders/trash' || Boolean(matchOrder) || path.startsWith('/chat/') || path.startsWith('/notifications') || path === '/legal-pages' || path === '/payment-settings' || path === '/payment-config-status' || path.startsWith('/payments/webhook/');
   if (!isCommercePath) return null;
   if (!env.DB) return json({ success: false, error: '此功能需要已绑定且迁移成功的 Cloudflare D1（DB）数据库' }, 503, headers);
@@ -273,6 +273,17 @@ export async function handleCommerceRequest(
     const actorId = isAdmin ? 'admin' : user?.id || '';
     if (!actorId) return json({ success: false, error: '请先登录有效账户后使用订单、客服和消息功能' }, 401, headers);
 
+    if (path === '/orders/trash' && request.method === 'DELETE') {
+      const body = await request.json() as any;
+      const ids = Array.isArray(body?.ids) ? [...new Set(body.ids.filter((id: unknown) => typeof id === 'string' && id.length > 0 && id.length <= 200))] : [];
+      if (!ids.length || ids.length > 100 || ids.length !== body.ids.length) return json({ success: false, error: '请提供1至100个有效且不重复的订单编号' }, 400, headers);
+      const placeholders = ids.map(() => '?').join(',');
+      const statement = isAdmin
+        ? env.DB.prepare(`DELETE FROM fox3_orders WHERE deletedAt IS NOT NULL AND id IN (${placeholders})`).bind(...ids)
+        : env.DB.prepare(`DELETE FROM fox3_orders WHERE deletedAt IS NOT NULL AND userId = ? AND id IN (${placeholders})`).bind(actorId, ...ids);
+      const result = await statement.run();
+      return json({ success: true, deletedCount: Number(result?.meta?.changes || 0) }, 200, headers);
+    }
     if (path === '/orders' && request.method === 'GET') {
       const result = isAdmin
         ? await env.DB.prepare('SELECT * FROM fox3_orders WHERE deletedAt IS NULL ORDER BY createdAt DESC LIMIT 500').all()
@@ -352,6 +363,13 @@ export async function handleCommerceRequest(
       const row = await loadOrder(env.DB, decodeURIComponent(orderId));
       if (!row) return json({ success: false, error: '订单不存在' }, 404, headers);
       if (!isAdmin && row.userId !== actorId) return json({ success: false, error: '无权访问此订单' }, 403, headers);
+      if (action === 'delete-permanent' && request.method === 'DELETE') {
+        if (row.deletedAt == null) return json({ success: false, error: '只能彻底删除回收站中的订单' }, 409, headers);
+        const result = isAdmin
+          ? await env.DB.prepare('DELETE FROM fox3_orders WHERE id = ? AND deletedAt IS NOT NULL').bind(row.id).run()
+          : await env.DB.prepare('DELETE FROM fox3_orders WHERE id = ? AND userId = ? AND deletedAt IS NOT NULL').bind(row.id, actorId).run();
+        return json({ success: true, deleted: Number(result?.meta?.changes || 0) > 0 }, 200, headers);
+      }
       if (action === 'restore' && request.method === 'POST') {
         await env.DB.prepare('UPDATE fox3_orders SET deletedAt = NULL, updatedAt = ? WHERE id = ?').bind(Date.now(), row.id).run();
         return json({ success: true, order: rowToOrder(await loadOrder(env.DB, row.id), isAdmin) }, 200, headers);
@@ -703,8 +721,31 @@ export async function handleCommerceRequest(
     }
     if (path === '/chat/messages' && request.method === 'POST') {
       const body = await request.json() as any;
-      const message = text(body?.message, 4000);
-      if (!message) return json({ success: false, error: '对话内容不能为空' }, 400, headers);
+      const plainMessage = text(body?.message, 4000);
+      const rawAttachments = body?.attachments;
+      if (rawAttachments !== undefined && (!Array.isArray(rawAttachments) || rawAttachments.length > 5)) return json({ success: false, error: '附件最多5个' }, 400, headers);
+      const attachments: Array<{ name: string; url: string; mime: string; size: number }> = [];
+      let totalBytes = 0;
+      for (const item of rawAttachments || []) {
+        const name = typeof item?.name === 'string' ? item.name.trim() : '';
+        const url = typeof item?.url === 'string' ? item.url.trim() : '';
+        const mime = typeof item?.mime === 'string' ? item.mime.trim().toLowerCase() : '';
+        const size = Number(item?.size);
+        let parsedUrl: URL;
+        try { parsedUrl = new URL(url, new URL(request.url).origin); } catch { return json({ success: false, error: '附件地址无效' }, 400, headers); }
+        const origin = new URL(request.url).origin;
+        const managedPath = parsedUrl.origin === origin && /^\/api\/files\/[A-Za-z0-9._%/-]+$/.test(parsedUrl.pathname) && !parsedUrl.pathname.split('/').some(part => part === '.' || part === '..') && !parsedUrl.search && !parsedUrl.hash;
+        const trustedStorage = parsedUrl.protocol === 'https:' && /^(?:[a-z0-9-]+\.)?r2\.dev$/.test(parsedUrl.hostname) && /^\/[A-Za-z0-9._%/-]+$/.test(parsedUrl.pathname);
+        const allowedMime = /^(image\/(?:png|jpeg|gif|webp|avif)|application\/(?:pdf|zip|json|msword|vnd\.openxmlformats-officedocument\.(?:wordprocessingml\.document|spreadsheetml\.sheet|presentationml\.presentation)|vnd\.ms-excel|vnd\.ms-powerpoint)|text\/(?:plain|csv|markdown))$/.test(mime);
+        if (!managedPath && !trustedStorage) return json({ success: false, error: '附件必须使用本站托管文件地址或可信云存储地址' }, 400, headers);
+        if (!name || name.length > 180 || /[\u0000-\u001f\u007f]/.test(name) || !allowedMime || !Number.isSafeInteger(size) || size < 1 || size > 20 * 1024 * 1024) return json({ success: false, error: '附件名称、类型或大小无效' }, 400, headers);
+        totalBytes += size;
+        if (totalBytes > 25 * 1024 * 1024) return json({ success: false, error: '附件总大小不能超过25 MB' }, 400, headers);
+        attachments.push({ name, url: managedPath ? `${parsedUrl.pathname}` : parsedUrl.toString(), mime, size });
+      }
+      if (!plainMessage && !attachments.length) return json({ success: false, error: '请输入消息或添加附件' }, 400, headers);
+      const message = attachments.length ? JSON.stringify({ type: 'siteowner-chat-v1', text: plainMessage, attachments }) : plainMessage;
+      if (message.length > 12000) return json({ success: false, error: '消息内容超出限制' }, 400, headers);
       let conversationId = text(body?.conversationId, 200);
       let conversation: any = conversationId ? await env.DB.prepare('SELECT id,userId,username,deletedAt FROM fox3_conversations WHERE id = ?').bind(conversationId).first() : null;
       if (isAdmin) {

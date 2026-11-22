@@ -1334,6 +1334,7 @@ export const onRequest = async (context: any) => {
         photos: ['id','title','url','originalFilename','thumbnail','category','folderId','folderName','width','height','description','createdAt','updatedAt'],
         media: ['id','type','title','artist','src','cover','duration','fileSize','uploadedAt','createdAt','updatedAt'],
       };
+      const previousData = current?.value ? JSON.parse(String(current.value)) : { books: [], photos: [], media: [] };
       const clean: Record<string, any[]> = {};
       for (const [kind, allowed] of Object.entries(definitions)) {
         const records = Array.isArray(body?.data?.[kind]) ? body.data[kind].slice(0, 2000) : [];
@@ -1351,6 +1352,29 @@ export const onRequest = async (context: any) => {
       }
       const serialized = JSON.stringify(clean);
       if (new TextEncoder().encode(serialized).byteLength > 2 * 1024 * 1024) return Response.json({ success: false, error: '个人媒体目录超过 2 MiB；大文件请使用对象存储链接' }, { status: 413, headers });
+      // Derive removals only from the authenticated user's persisted row; ignore client ownerId.
+      // Legacy upload keys are globally shared, so only the dedicated per-user namespace is deletable.
+      const extractManagedKey = (value: unknown): string | null => {
+        if (typeof value !== 'string' || value.length > 2048) return null;
+        let parsed: URL;
+        try { parsed = new URL(value, url.origin); } catch { return null; }
+        if (parsed.origin !== url.origin || parsed.search || parsed.hash) return null;
+        const match = parsed.pathname.match(/^\/api\/files\/(.+)$/);
+        if (!match) return null;
+        let key = '';
+        try { key = decodeURIComponent(match[1]); } catch { return null; }
+        if (!/^user-media\/[A-Za-z0-9_-]{1,128}\/(?:[^/]{1,180})$/.test(key) || !key.startsWith(`user-media/${user.id}/`)) return null;
+        return key;
+      };
+      const nextPhotoIds = new Set(clean.photos.map(item => item.id));
+      const removedPhotos = (Array.isArray(previousData.photos) ? previousData.photos : []).filter((item: any) => item && typeof item.id === 'string' && !nextPhotoIds.has(item.id));
+      const cleanupKeys = new Set<string>();
+      for (const photo of removedPhotos) for (const value of [photo.url, photo.thumbnail]) {
+        const key = extractManagedKey(value);
+        if (key) cleanupKeys.add(key);
+      }
+      const bucket = env.R2_BUCKET || env.R2 || env.BUCKET;
+      const external = getExternalObjectStoreConfig(env);
       const now = Date.now();
       const result = await env.DB.prepare(`INSERT INTO fox3_user_media (userId, value, revision, updatedAt)
         SELECT ?, ?, 1, ? WHERE ? = 0 OR EXISTS (SELECT 1 FROM fox3_user_media WHERE userId = ?)
@@ -1360,7 +1384,29 @@ export const onRequest = async (context: any) => {
         const latest = await env.DB.prepare('SELECT revision FROM fox3_user_media WHERE userId = ?').bind(user.id).first();
         return Response.json({ success: false, conflict: true, revision: Number(latest?.revision || 0), error: '个人文件已在其他设备更新，请刷新后重试' }, { status: 409, headers });
       }
-      return Response.json({ success: true, revision: expectedRevision + 1, updatedAt: now }, { headers });
+      const cleanupFailures: string[] = [];
+      for (const key of cleanupKeys) {
+        let failed = false;
+        if (bucket) try { await bucket.delete(key); } catch (error: any) {
+          failed = true;
+          console.warn('[User Media] R2 object cleanup failed:', String(error?.message || error).slice(0, 180));
+        }
+        if (external) try { await deleteExternalObject(external, key); } catch (error: any) {
+          failed = true;
+          console.warn('[User Media] external object cleanup failed:', String(error?.message || error).slice(0, 180));
+        }
+        // Remove any bounded fallback copy as well; older installs may have persisted the
+        // same generated key in D1/KV or in the current isolate's memory cache.
+        try { await env.DB.prepare('DELETE FROM fox3_files WHERE key = ?').bind(key).run(); } catch {}
+        if (env.KV) try { await env.KV.delete(`fox3_file_${key}`); } catch (error: any) {
+          failed = true;
+          console.warn('[User Media] KV object cleanup failed:', String(error?.message || error).slice(0, 180));
+        }
+        const memoryFiles = (globalThis as any).__fox3_file_store;
+        if (memoryFiles && Object.prototype.hasOwnProperty.call(memoryFiles, key)) delete memoryFiles[key];
+        if (failed) cleanupFailures.push(key);
+      }
+      return Response.json({ success: true, revision: expectedRevision + 1, updatedAt: now, ...(cleanupFailures.length ? { cleanupPending: true, cleanupFailures: cleanupFailures.length, message: '照片目录已删除，但部分原文件或缩略图清理失败；该项目可能仍可访问，请联系管理员重试。' } : {}) }, { headers });
     } catch (error: any) {
       console.error('[User Media] D1 operation failed:', String(error?.message || error).slice(0, 180));
       return Response.json({ success: false, error: '个人媒体同步失败，请检查 D1（DB）绑定' }, { status: 503, headers });
@@ -1512,6 +1558,38 @@ export const onRequest = async (context: any) => {
         const serialized = JSON.stringify(content);
         if (new TextEncoder().encode(serialized).byteLength > 4 * 1024 * 1024) return Response.json({ success: false, error: '站点内容超过 4 MiB；大文件请存入对象存储，仅同步文件链接和元数据' }, { status: 413, headers });
         if (current?.value && String(current.value) === serialized) return Response.json({ success: true, syncedToCloud: true, unchanged: true, revision: Number(current.revision || 1), updatedAt: Number(current.updatedAt || 0) }, { headers });
+        const managedSiteKey = (value: unknown): string | null => {
+          if (typeof value !== 'string' || value.length > 2048) return null;
+          let parsed: URL;
+          try { parsed = new URL(value, url.origin); } catch { return null; }
+          if (parsed.origin !== url.origin || parsed.search || parsed.hash) return null;
+          const match = parsed.pathname.match(/^\/api\/files\/([^/]+)$/);
+          if (!match) return null;
+          let key = '';
+          try { key = decodeURIComponent(match[1]); } catch { return null; }
+          // Only keys generated by the current upload API are eligible. Never infer ownership
+          // for user-media namespaces or legacy/shared object names.
+          if (key.includes('/') || !/^(?:[0-9]{10,13}-[0-9a-f-]{36}-[A-Za-z0-9._-]{1,150}|multipart-[1-9][0-9]*-[0-9]{10,13}-[0-9a-f-]{36}-[A-Za-z0-9._-]{1,150})$/i.test(key)) return null;
+          return key;
+        };
+        const collectObjectKeys = (value: unknown, keys = new Set<string>()): Set<string> => {
+          if (typeof value === 'string') { const key = managedSiteKey(value); if (key) keys.add(key); }
+          else if (Array.isArray(value)) value.forEach(item => collectObjectKeys(item, keys));
+          else if (value && typeof value === 'object') Object.values(value as Record<string, unknown>).forEach(item => collectObjectKeys(item, keys));
+          return keys;
+        };
+        const oldPublic = current?.value ? sanitize(JSON.parse(String(current.value))) : {};
+        const nextPhotoById = new Map((content.photos || []).map((photo: any) => [photo.id, photo]));
+        const cleanupCandidates = new Set<string>();
+        for (const oldPhoto of (oldPublic.photos || []) as any[]) {
+          const nextPhoto: any = nextPhotoById.get(oldPhoto.id);
+          for (const field of ['url', 'thumbnail']) {
+            if (oldPhoto[field] && (!nextPhoto || nextPhoto[field] !== oldPhoto[field])) {
+              const key = managedSiteKey(oldPhoto[field]);
+              if (key) cleanupCandidates.add(key);
+            }
+          }
+        }
         const result = await env.DB.prepare(`INSERT INTO fox3_site_content (id, value, revision, updatedAt)
           SELECT 'published', ?, 1, ? WHERE ? = 0 OR EXISTS (SELECT 1 FROM fox3_site_content WHERE id = 'published')
           ON CONFLICT(id) DO UPDATE SET value = excluded.value, revision = fox3_site_content.revision + 1, updatedAt = excluded.updatedAt
@@ -1521,7 +1599,26 @@ export const onRequest = async (context: any) => {
           return Response.json({ success: false, conflict: true, revision: Number(latest?.revision || 0), error: '站点内容已在其他设备更新。请刷新后再编辑，避免覆盖新内容。' }, { status: 409, headers });
         }
         const saved = await env.DB.prepare('SELECT revision, updatedAt FROM fox3_site_content WHERE id = ?').bind('published').first();
-        return Response.json({ success: true, syncedToCloud: true, revision: Number(saved?.revision || 1), updatedAt: Number(saved?.updatedAt || Date.now()) }, { headers });
+        const referencedKeys = collectObjectKeys(content);
+        try {
+          const rows = await env.DB.prepare('SELECT value FROM fox3_user_media').all();
+          for (const row of rows?.results || []) try { collectObjectKeys(JSON.parse(String(row.value || '{}')), referencedKeys); } catch {}
+        } catch {}
+        const remainingKeys = [...cleanupCandidates].filter(key => !referencedKeys.has(key));
+        const cleanupFailures: string[] = [];
+        const bucket = env.R2_BUCKET || env.R2 || env.BUCKET;
+        const external = getExternalObjectStoreConfig(env);
+        for (const key of remainingKeys) {
+          let failed = false;
+          if (bucket) try { await bucket.delete(key); } catch (error: any) { failed = true; console.warn('[Site Content] R2 photo cleanup failed:', String(error?.message || error).slice(0, 180)); }
+          if (external) try { await deleteExternalObject(external, key); } catch (error: any) { failed = true; console.warn('[Site Content] external photo cleanup failed:', String(error?.message || error).slice(0, 180)); }
+          try { await env.DB.prepare('DELETE FROM fox3_files WHERE key = ?').bind(key).run(); } catch (error: any) { if (!/no such table/i.test(String(error?.message || error))) failed = true; }
+          if (env.KV) try { await env.KV.delete(`fox3_file_${key}`); } catch { failed = true; }
+          const memoryFiles = (globalThis as any).__fox3_file_store;
+          if (memoryFiles && Object.prototype.hasOwnProperty.call(memoryFiles, key)) delete memoryFiles[key];
+          if (failed) cleanupFailures.push(key);
+        }
+        return Response.json({ success: true, syncedToCloud: true, revision: Number(saved?.revision || 1), updatedAt: Number(saved?.updatedAt || Date.now()), ...(cleanupFailures.length ? { cleanupPending: true, cleanupFailures: cleanupFailures.length, message: '相册记录已保存，但部分托管原图/缩略图清理失败；文件可能仍可访问，请联系管理员检查存储绑定。' } : {}) }, { headers });
       }
       return Response.json({ success: false, error: 'Method not allowed' }, { status: 405, headers });
     } catch (error: any) {
@@ -1645,6 +1742,12 @@ export const onRequest = async (context: any) => {
   // Large uploads are split in the browser into small requests so Pages/Workers request-body
   // limits do not cap the complete file. R2 itself supports multipart objects up to 5 TiB.
   const uploadBucket = env.R2_BUCKET || env.R2 || env.BUCKET;
+  const canAccessMultipartKey = async (key: string) => {
+    const namespace = key.match(/^user-media\/([A-Za-z0-9_-]{1,128})\//);
+    if (!namespace) return true; // Preserve the legacy, non-user-namespaced upload flow.
+    const user = await getAuthenticatedUser(request, env);
+    return Boolean((user && user.id === namespace[1]) || await hasAdminSession(request, env));
+  };
   if (path === '/upload/multipart/create' && request.method === 'POST') {
     if (!uploadBucket) return Response.json({ success: false, error: '大文件分块上传需要绑定 R2_BUCKET 对象存储' }, { status: 503, headers });
     try {
@@ -1656,7 +1759,8 @@ export const onRequest = async (context: any) => {
       const name = String(input.name || 'upload.bin').slice(0, 240);
       if (/\.(html?|xhtml|svg|xml|js|mjs|cjs|wasm|php|phtml|exe|dll|bat|cmd|sh)$/i.test(name) || /^(text\/html|application\/xhtml\+xml|image\/svg\+xml|text\/xml|application\/xml|application\/(javascript|ecmascript|wasm|x-msdownload)|text\/javascript)/i.test(String(input.type || ''))) return Response.json({ success: false, error: '不接受可执行网页、脚本或程序文件' }, { status: 415, headers });
       const safeName = name.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 150) || 'upload.bin';
-      const key = `multipart/${expectedSize}/${Date.now()}-${crypto.randomUUID()}-${safeName}`;
+      const owner = await getAuthenticatedUser(request, env);
+      const key = `${owner ? `user-media/${owner.id}/` : ''}multipart-${expectedSize}-${Date.now()}-${crypto.randomUUID()}-${safeName}`;
       const upload = await uploadBucket.createMultipartUpload(key, { httpMetadata: { contentType: String(input.type || 'application/octet-stream') }, customMetadata: { originalName: encodeURIComponent(name), expectedSize: String(expectedSize), uploadedAt: String(Date.now()) } });
       return Response.json({ success: true, key, uploadId: upload.uploadId, name, type: String(input.type || 'application/octet-stream') }, { headers });
     } catch (error: any) { return Response.json({ success: false, error: error?.message || '无法创建 R2 分块上传' }, { status: 500, headers }); }
@@ -1665,6 +1769,7 @@ export const onRequest = async (context: any) => {
     if (!uploadBucket) return Response.json({ success: false, error: 'R2_BUCKET 未绑定' }, { status: 503, headers });
     const key = url.searchParams.get('key') || '', uploadId = url.searchParams.get('uploadId') || '', partNumber = Number(url.searchParams.get('partNumber'));
     if (!key || !uploadId || !Number.isInteger(partNumber) || partNumber < 1 || partNumber > 10000 || !request.body) return Response.json({ success: false, error: '分块参数缺失或无效' }, { status: 400, headers });
+    if (!await canAccessMultipartKey(key)) return Response.json({ success: false, error: '无权操作其他用户的分块文件' }, { status: 403, headers });
     const contentLength = Number(request.headers.get('content-length') || 0);
     if (contentLength > 8 * 1024 * 1024) return Response.json({ success: false, error: '单个分块不能超过 8 MiB' }, { status: 413, headers });
     try { const part = await uploadBucket.resumeMultipartUpload(key, uploadId).uploadPart(partNumber, request.body); return Response.json({ success: true, part }, { headers }); }
@@ -1672,7 +1777,7 @@ export const onRequest = async (context: any) => {
   }
   if (path === '/upload/multipart/abort' && request.method === 'POST') {
     if (!uploadBucket) return Response.json({ success: false, error: 'R2_BUCKET 未绑定' }, { status: 503, headers });
-    try { const input = await request.json() as { key?: string; uploadId?: string }; if (!input.key || !input.uploadId) return Response.json({ success: false, error: '缺少 key 或 uploadId' }, { status: 400, headers }); await uploadBucket.resumeMultipartUpload(input.key, input.uploadId).abort(); return Response.json({ success: true }, { headers }); }
+    try { const input = await request.json() as { key?: string; uploadId?: string }; if (!input.key || !input.uploadId) return Response.json({ success: false, error: '缺少 key 或 uploadId' }, { status: 400, headers }); if (!await canAccessMultipartKey(input.key)) return Response.json({ success: false, error: '无权操作其他用户的分块文件' }, { status: 403, headers }); await uploadBucket.resumeMultipartUpload(input.key, input.uploadId).abort(); return Response.json({ success: true }, { headers }); }
     catch (error: any) { return Response.json({ success: false, error: error?.message || '无法取消分块上传' }, { status: 502, headers }); }
   }
   if (path === '/upload/multipart/complete' && request.method === 'POST') {
@@ -1680,7 +1785,8 @@ export const onRequest = async (context: any) => {
     try {
       const input = await request.json() as { key?: string; uploadId?: string; parts?: any[]; name?: string; type?: string; size?: number };
       if (!input.key || !input.uploadId || !Array.isArray(input.parts) || !input.parts.length || input.parts.length > 10000) return Response.json({ success: false, error: '分块完成参数无效' }, { status: 400, headers });
-      const sizeMatch = /^multipart\/([1-9][0-9]*)\/[0-9]+-[0-9a-f-]+-[a-zA-Z0-9._-]+$/.exec(input.key);
+      if (!await canAccessMultipartKey(input.key)) return Response.json({ success: false, error: '无权完成其他用户的分块文件' }, { status: 403, headers });
+      const sizeMatch = /^(?:user-media\/[A-Za-z0-9_-]{1,128}\/)?multipart-([1-9][0-9]*)-[0-9]+-[0-9a-f-]+-[a-zA-Z0-9._-]+$/.exec(input.key);
       if (!sizeMatch) return Response.json({ success: false, error: '分块对象键无效' }, { status: 400, headers });
       const multipart = uploadBucket.resumeMultipartUpload(input.key, input.uploadId);
       const expectedSize = Number(sizeMatch[1]);
@@ -1721,7 +1827,8 @@ export const onRequest = async (context: any) => {
       }
 
       const safeFileName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 150) || 'upload.bin';
-      const key = `${Date.now()}-${crypto.randomUUID()}-${safeFileName}`;
+      const owner = await getAuthenticatedUser(request, env);
+      const key = `${owner ? `user-media/${owner.id}/` : ''}${Date.now()}-${crypto.randomUUID()}-${safeFileName}`;
       const contentType = file.type || 'application/octet-stream';
       let storedTarget = 'none';
 

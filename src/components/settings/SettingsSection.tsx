@@ -57,17 +57,14 @@ export const SettingsSection: React.FC = () => {
   const tx = (source: string) => translateInline(locale, source);
 
   const {
-    trashItems,
-    restoreFromTrash,
-    permanentDeleteFromTrash,
-    emptyTrash,
     themeMode,
     setThemeMode,
   } = useApp();
 
   // In-page translator state with custom API support
   const [translateSource, setTranslateSource] = useState('zh');
-  const [notebookDraft, setNotebookDraft] = useState('');
+  type NotebookEntry = { id: string; text: string; images: string[] };
+  const [notebookEntries, setNotebookEntries] = useState<NotebookEntry[]>([]);
   const [notebookBusy, setNotebookBusy] = useState(false);
   const [showThemeHelp, setShowThemeHelp] = useState(false);
   const [translateTarget, setTranslateTarget] = useState('en');
@@ -137,23 +134,37 @@ export const SettingsSection: React.FC = () => {
     if (!token) return;
     void fetch('/api/admin/notebook', { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' }, cache: 'no-store' })
       .then(response => response.json().then(data => ({ response, data })))
-      .then(({ response, data }) => { if (response.ok && data.success) setNotebookDraft(String(data.content || '')); })
+      .then(({ response, data }) => { if (response.ok && data.success) { const raw = String(data.content || ''); try { const parsed = JSON.parse(raw); if (parsed?.format === 'fox3-notebook-v1' && Array.isArray(parsed.entries)) setNotebookEntries(parsed.entries.map((entry: any, i: number) => ({ id: String(entry.id || `note-${i}`), text: String(entry.text || ''), images: Array.isArray(entry.images) ? entry.images.map(String) : [] }))); else setNotebookEntries(raw ? [{ id: 'legacy-note', text: raw, images: [] }] : []); } catch { setNotebookEntries(raw ? [{ id: 'legacy-note', text: raw, images: [] }] : []); } } })
       .catch(() => undefined);
   }, [currentUser?.role]);
-  const saveNotebook = async (remove = false) => {
+  const saveNotebook = async (entries = notebookEntries) => {
     const token = getAdminSessionToken();
     if (!token) { showToast(tx('需要管理员会话才能保存记事本'), 'error'); return; }
     setNotebookBusy(true);
     try {
-      const response = await fetch('/api/admin/notebook', { method: remove ? 'DELETE' : 'PUT', headers: { Authorization: `Bearer ${token}`, ...(remove ? {} : { 'Content-Type': 'application/json' }) }, ...(remove ? {} : { body: JSON.stringify({ content: notebookDraft }) }) });
+      const response = await fetch('/api/admin/notebook', { method: 'PUT', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ content: JSON.stringify({ format: 'fox3-notebook-v1', entries }) }) });
       const result = await response.json();
       if (!response.ok || !result.success) throw new Error(result.error || tx('保存失败'));
-      if (remove) setNotebookDraft('');
-      showToast(remove ? tx('记事本已删除并同步') : tx('记事本已保存并同步至 D1'), 'success');
+      showToast(tx('记事本已保存并同步至 D1'), 'success');
     } catch (error: any) { showToast(error?.message || tx('记事本保存失败'), 'error'); }
     finally { setNotebookBusy(false); }
   };
-
+  const deleteNotebookEntry = async (id: string) => {
+    const next = notebookEntries.filter(entry => entry.id !== id);
+    setNotebookEntries(next);
+    await saveNotebook(next);
+  };
+  const addNotebookEntry = () => setNotebookEntries(entries => [...entries, { id: `${Date.now()}-${Math.random().toString(36).slice(2)}`, text: '', images: [] }]);
+  const uploadNotebookImage = async (id: string, file: File) => {
+    try {
+      const uploaded = await uploadFile(file);
+      if (!uploaded?.url || uploaded.url.startsWith('idb_file_')) throw new Error(tx('图片未能上传到持久化云端存储'));
+      const next = notebookEntries.map(entry => entry.id === id ? { ...entry, images: [...entry.images, uploaded.url] } : entry);
+      setNotebookEntries(next);
+      await saveNotebook(next);
+      showToast(tx('图片已上传并保存记事本链接'), 'success');
+    } catch (error: any) { showToast(error?.message || tx('图片上传失败'), 'error'); }
+  };
   const toggleSection = (key: string) => {
     setCollapsedSections(prev => {
       const next = { ...prev, [key]: !prev[key] };
@@ -429,7 +440,9 @@ export const SettingsSection: React.FC = () => {
 
       <section className={`rounded-3xl border border-slate-200 bg-white shadow-sm dark:border-slate-800 dark:bg-slate-900 overflow-hidden`}>
         <button type="button" onClick={()=>toggleSection('notebook')} aria-expanded={!collapsedSections.notebook} className="w-full flex items-center justify-between p-5 text-left"><span className="text-sm font-bold">{tx('同步记事本')}</span>{collapsedSections.notebook?<ChevronDown className="w-4 h-4"/>:<ChevronUp className="w-4 h-4"/>}</button>
-        {!collapsedSections.notebook&&<div className="p-5 pt-0 space-y-3"><p className="text-xs text-slate-500">{tx('记事本通过管理员会话私密保存到 D1，仅管理员可读写，并在已登录设备间同步。')}</p><textarea value={notebookDraft} onChange={e=>setNotebookDraft(e.target.value)} rows={7} className="w-full rounded-xl border border-slate-200 dark:border-slate-700 bg-transparent p-3 text-sm" placeholder={tx('在这里编辑备忘内容…')}/><div className="flex flex-wrap gap-2"><button type="button" onClick={()=>void saveNotebook()} disabled={notebookBusy} className="rounded-xl bg-sky-600 px-4 py-2 text-xs font-semibold text-white disabled:opacity-50">{notebookBusy?tx('保存中…'):tx('保存并同步')}</button><button type="button" onClick={()=>void saveNotebook(true)} disabled={notebookBusy} className="rounded-xl border border-rose-200 px-4 py-2 text-xs text-rose-600 disabled:opacity-50">{tx('删除记事本')}</button></div></div>}
+        {!collapsedSections.notebook&&<div className="p-5 pt-0 space-y-3"><p className="text-xs text-slate-500">{tx('记事本通过管理员会话私密保存到 D1；每条可单独编辑、附图并保存，旧版纯文本会自动作为一条记录显示。')}</p>
+          <div className="space-y-3">{notebookEntries.map((entry, index) => <article key={entry.id} className="rounded-xl border border-slate-200 dark:border-slate-700 p-3 space-y-2 min-w-0"><div className="flex items-center justify-between gap-2"><strong className="text-xs">{tx('记事')} {index + 1}</strong><button type="button" disabled={notebookBusy} onClick={() => void deleteNotebookEntry(entry.id)} className="rounded-lg border border-rose-200 px-3 py-1.5 text-xs text-rose-600">{tx('删除此条')}</button></div><textarea value={entry.text} onChange={e => setNotebookEntries(items => items.map(item => item.id === entry.id ? { ...item, text: e.target.value } : item))} rows={4} className="w-full min-w-0 rounded-xl border border-slate-200 dark:border-slate-700 bg-transparent p-3 text-sm" placeholder={tx('填写备忘内容…')}/>{entry.images.length > 0 && <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">{entry.images.map((url, i) => <a key={`${url}-${i}`} href={url} target="_blank" rel="noreferrer"><img src={url} alt={`${tx('记事图片')} ${i + 1}`} className="w-full h-24 object-cover rounded-lg" /></a>)}</div>}<label className="inline-flex cursor-pointer rounded-lg border px-3 py-2 text-xs">{tx('添加图片')}<input type="file" accept="image/*" className="hidden" onChange={e => { const file=e.target.files?.[0]; if(file) void uploadNotebookImage(entry.id,file); e.currentTarget.value=''; }} /></label></article>)}</div>
+          <div className="flex flex-wrap gap-2"><button type="button" onClick={addNotebookEntry} className="rounded-xl border px-4 py-2 text-xs">{tx('新增记事')}</button><button type="button" onClick={() => void saveNotebook()} disabled={notebookBusy} className="rounded-xl bg-sky-600 px-4 py-2 text-xs font-semibold text-white disabled:opacity-50">{notebookBusy?tx('保存中…'):tx('保存并同步全部')}</button></div></div>}
       </section>
       {/* SECTION 1: 主题调色与全局背景自定义选区 (从上到下按键功能顺序严格对应) */}
       <div className={`rounded-3xl border shadow-sm overflow-hidden transition-all duration-300 ${
@@ -1008,102 +1021,6 @@ export const SettingsSection: React.FC = () => {
         )}
       </div>
 
-      {/* SECTION 4: 全站回收站 (收纳所有删除的文件、邮件、信息、博客) */}
-      <div className={`rounded-3xl border shadow-sm overflow-hidden transition-all duration-300 ${
-        systemSettings.transparentCards
-          ? 'bg-white/70 dark:bg-slate-900/70 backdrop-blur-md border-white/20'
-          : 'bg-white dark:bg-slate-900 border-slate-200/80 dark:border-slate-800'
-      }`}>
-        <div
-          onClick={() => toggleSection('trash')}
-          className="p-5 flex items-center justify-between cursor-pointer hover:bg-slate-50/50 dark:hover:bg-slate-800/50 transition border-b border-slate-100 dark:border-slate-800"
-        >
-          <div className="flex items-center gap-2">
-            <Trash2 className="w-5 h-5 text-rose-500" />
-            <h3 className="text-sm font-bold text-slate-900 dark:text-slate-100">
-              全站回收站管理中心 (收纳博客、文件、邮件、信息与快照)
-            </h3>
-          </div>
-          <div className="flex items-center gap-3">
-            <span className="text-xs px-2.5 py-0.5 rounded-full bg-rose-50 text-rose-600 dark:bg-rose-950/40 dark:text-rose-400 font-mono">
-              {trashItems.length} 项已删除
-            </span>
-            {collapsedSections.trash ? (
-              <ChevronDown className="w-5 h-5 text-slate-400" />
-            ) : (
-              <ChevronUp className="w-5 h-5 text-slate-400" />
-            )}
-          </div>
-        </div>
-
-        {!collapsedSections.trash && (
-          <div className="p-6 space-y-4">
-            <div className="flex items-center justify-between pb-3 border-b border-slate-100 dark:border-slate-800">
-              <span className="text-xs text-slate-500">
-                误删文件与信息可在此一键还原恢复；或彻底清空回收站释放空间。
-              </span>
-              {trashItems.length > 0 && (
-                <button
-                  onClick={() => {
-                    if (window.confirm('确认清空回收站的所有内容吗？此操作不可逆！')) {
-                      emptyTrash();
-                    }
-                  }}
-                  className="px-3 py-1 bg-rose-500 text-white text-xs font-medium rounded-xl hover:bg-rose-600 transition"
-                >
-                  清空回收站
-                </button>
-              )}
-            </div>
-
-            {trashItems.length === 0 ? (
-              <div className="py-8 text-center text-xs text-slate-400">
-                回收站为空，暂无已删除内容。
-              </div>
-            ) : (
-              <div className="divide-y divide-slate-100 dark:divide-slate-800 border rounded-2xl overflow-hidden">
-                {trashItems.map(item => (
-                  <div key={item.id} className="p-3.5 flex items-center justify-between gap-3 bg-slate-50/40 dark:bg-slate-800/30">
-                    <div>
-                      <div className="flex items-center gap-2">
-                        <span className="text-[10px] font-bold uppercase px-2 py-0.5 rounded bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-300">
-                          {item.originType}
-                        </span>
-                        <h4 className="text-xs font-bold text-slate-800 dark:text-slate-100">
-                          {item.title}
-                        </h4>
-                      </div>
-                      <p className="text-[11px] text-slate-400 mt-1 line-clamp-1">{item.preview || '无预览内容'}</p>
-                      <span className="text-[10px] text-slate-400 mt-0.5 block">
-                        删除时间: {new Date(item.deletedAt).toLocaleString()}
-                      </span>
-                    </div>
-
-                    <div className="flex items-center gap-2 shrink-0">
-                      <button
-                        onClick={() => restoreFromTrash(item.id)}
-                        className="flex items-center gap-1 px-2.5 py-1 text-xs font-medium rounded-lg bg-emerald-50 text-emerald-600 dark:bg-emerald-950/40 dark:text-emerald-400 hover:bg-emerald-100"
-                        title="还原项目"
-                      >
-                        <RotateCcw className="w-3.5 h-3.5" />
-                        <span>还原</span>
-                      </button>
-                      <button
-                        onClick={() => permanentDeleteFromTrash(item.id)}
-                        className="p-1.5 text-slate-400 hover:text-rose-600 rounded-lg hover:bg-rose-50 dark:hover:bg-rose-950/40"
-                        title="彻底粉碎删除"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-      </div>
-
       {/* SECTION 5: 站内密码修改与管理员唯一性保护 */}
       <div className={`rounded-3xl border shadow-sm overflow-hidden transition-all duration-300 ${
         systemSettings.transparentCards
@@ -1435,6 +1352,8 @@ export const SettingsSection: React.FC = () => {
           </span>
         </div>
 
+        <button type="button" onClick={() => toggleSection('font')} aria-expanded={!collapsedSections.font} className="flex w-full items-center justify-between rounded-xl border px-3 py-2 text-left text-xs font-semibold">{tx('字体选项与上传')}{collapsedSections.font ? <ChevronDown className="w-4 h-4"/> : <ChevronUp className="w-4 h-4"/>}</button>
+        {!collapsedSections.font && <>
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2.5">
           {[
             { id: 'default', label: '系统默认', desc: '现代无衬线标准体' },
@@ -1537,6 +1456,7 @@ export const SettingsSection: React.FC = () => {
             </p>
           </div>
         </div>
+        </>}
       </section>
     </div>
   );
